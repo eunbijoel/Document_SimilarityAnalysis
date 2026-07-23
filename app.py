@@ -3,6 +3,13 @@
 여러 PDF 문서를 업로드하면 동일하거나 유사한 문장/페이지/이미지를 찾아 보여주는
 내부 검토용 Streamlit 도구입니다. 표절 여부를 자동으로 판정하지 않습니다.
 """
+import os
+
+# Keras 3 / Transformers 충돌 방지 (다른 import보다 먼저)
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+os.environ.setdefault("TRANSFORMERS_NO_FLAX", "1")
+
 import traceback
 
 import streamlit as st
@@ -33,6 +40,16 @@ from src.utils.config import (
     DEFAULT_MAX_RESULTS,
     DEFAULT_MAX_SENTENCES,
 )
+from src.utils.summary_stats import (
+    compute_sentence_overlap_stats,
+    compute_similarity_distribution,
+    compute_file_pair_matrix,
+    collect_matched_page_keys,
+)
+from src.utils.page_screenshots import (
+    build_matched_page_screenshots,
+    screenshots_to_zip,
+)
 
 st.set_page_config(page_title="문서 간 유사 콘텐츠 분석기", layout="wide")
 
@@ -52,6 +69,7 @@ def run_analysis(uploaded_files, settings):
     all_sentences = []
     all_images = []
     all_pages = []
+    pdf_bytes_by_name: dict[str, bytes] = {}
 
     progress_bar = st.progress(0.0)
     status_text = st.empty()
@@ -61,6 +79,7 @@ def run_analysis(uploaded_files, settings):
         status_text.text(f"처리 중: {uploaded_file.name} ({idx + 1}/{total})")
         try:
             file_bytes = uploaded_file.read()
+            pdf_bytes_by_name[uploaded_file.name] = file_bytes
             result = parse_pdf(
                 uploaded_file.name,
                 file_bytes,
@@ -165,8 +184,20 @@ def run_analysis(uploaded_files, settings):
         image_pairs.sort(key=lambda p: p["phash_distance"])
         image_pairs = image_pairs[: settings["max_results"]]
 
+    # --- 유사 문장 페이지 PNG 렌더 ---
+    status_text.text("유사 문장 페이지 스크린샷 생성 중...")
+    page_keys = collect_matched_page_keys(sentence_pairs)
+    matched_page_pngs = build_matched_page_screenshots(
+        pdf_bytes_by_name, page_keys, dpi=120
+    )
+
     status_text.text("분석이 완료되었습니다.")
     progress_bar.progress(1.0)
+
+    file_names = [f.name for f in uploaded_files]
+    overlap_stats = compute_sentence_overlap_stats(all_sentences, sentence_pairs)
+    sim_dist = compute_similarity_distribution(sentence_pairs)
+    file_matrix = compute_file_pair_matrix(sentence_pairs, file_names)
 
     return {
         "sentences": all_sentences,
@@ -177,24 +208,78 @@ def run_analysis(uploaded_files, settings):
         "image_pairs": image_pairs,
         "log_entries": log_entries,
         "sentences_truncated": truncated,
+        "pdf_bytes_by_name": pdf_bytes_by_name,
+        "matched_page_pngs": matched_page_pngs,
+        "overlap_stats": overlap_stats,
+        "similarity_distribution": sim_dist,
+        "file_matrix": file_matrix,
+        "file_names": file_names,
     }
 
 
 def render_summary_tab(analysis, uploaded_files):
+    import pandas as pd
+
     log_entries = analysis["log_entries"]
     success_count = sum(1 for e in log_entries if e["status"] == "성공")
     fail_count = sum(1 for e in log_entries if e["status"] == "실패")
+    overlap = analysis.get("overlap_stats") or compute_sentence_overlap_stats(
+        analysis["sentences"], analysis["sentence_pairs"]
+    )
 
+    st.subheader("기본 지표")
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("파일 수", len(uploaded_files))
     col1.metric("정상 처리", success_count)
     col2.metric("실패", fail_count)
     col2.metric("추출 페이지", len(analysis.get("pages", [])))
-    col3.metric("추출 문장", len(analysis["sentences"]))
-    col3.metric("유사 페이지 쌍", len(analysis.get("page_pairs", [])))
-    col4.metric("유사 문장 쌍", len(analysis["sentence_pairs"]))
+    col3.metric("추출 문장", overlap["total_sentences"])
+    col3.metric("유사 문장 쌍", len(analysis["sentence_pairs"]))
+    col4.metric("유사 페이지 쌍", len(analysis.get("page_pairs", [])))
     col4.metric("유사 이미지 쌍", len(analysis["image_pairs"]))
-    st.metric("추출 이미지", len(analysis["images"]))
+
+    # --- 1) 전체 문장 대비 겹침 ---
+    st.subheader("문장 겹침 요약")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("추출 문장 수", overlap["total_sentences"])
+    c2.metric("겹친 문장 수", overlap["overlapped_sentences"])
+    c3.metric("겹침 비율", f"{overlap['overlap_ratio_pct']}%")
+    st.caption("겹친 문장 = 유사 문장 쌍에 한 번이라도 등장한 문장(중복 제거).")
+    per_file_df = overlap.get("per_file_df")
+    if per_file_df is not None and not per_file_df.empty:
+        st.markdown("**파일별 문장 겹침**")
+        st.dataframe(per_file_df, use_container_width=True, hide_index=True)
+
+    # --- 2) 유사도 구간 분포 그래프 ---
+    st.subheader("유사도 구간 분포 (문장 쌍)")
+    dist_df = analysis.get("similarity_distribution")
+    if dist_df is None or (hasattr(dist_df, "empty") and dist_df.empty):
+        dist_df = compute_similarity_distribution(analysis["sentence_pairs"])
+    if dist_df is not None and not dist_df.empty:
+        st.dataframe(dist_df, use_container_width=True, hide_index=True)
+        st.bar_chart(dist_df, x="유사도 구간", y="쌍 개수")
+        st.caption("X축: 유사도 구간(1.0 / 0.9대 / …) · Y축: 해당 구간 쌍 개수")
+    else:
+        st.info("유사 문장 쌍이 없어 분포를 그릴 수 없습니다.")
+
+    # --- 3) 파일×파일 매트릭스 ---
+    st.subheader("파일 × 파일 유사 문장 쌍 수")
+    matrix = analysis.get("file_matrix")
+    if matrix is None or (hasattr(matrix, "empty") and matrix.empty):
+        names = analysis.get("file_names") or [f.name for f in uploaded_files]
+        matrix = compute_file_pair_matrix(analysis["sentence_pairs"], names)
+    if matrix is not None and not matrix.empty:
+        st.dataframe(matrix, use_container_width=True)
+        st.caption("행·열 = 파일명, 칸 값 = 두 파일 사이 유사 문장 쌍 개수 (파일이 늘면 행/열이 늘어납니다).")
+        # bar_chart는 index 이름에 특수문자(\\ 등)가 있으면 오류가 나므로 안전하게 정리
+        participation = matrix.sum(axis=1).astype(int)
+        chart_df = pd.DataFrame(
+            {"파일": participation.index.astype(str), "유사쌍_참여수": participation.values}
+        )
+        st.bar_chart(chart_df, x="파일", y="유사쌍_참여수")
+        st.caption("파일별 유사 문장 쌍 참여 횟수 합계")
+    else:
+        st.info("파일 매트릭스를 만들 데이터가 없습니다.")
 
     st.subheader("파일별 발견 건수")
     per_file_counts = {}
@@ -212,8 +297,6 @@ def render_summary_tab(analysis, uploaded_files):
             per_file_counts[f]["유사 이미지"] += 1
 
     if per_file_counts:
-        import pandas as pd
-
         df = pd.DataFrame.from_dict(per_file_counts, orient="index")
         df.index.name = "파일명"
         st.dataframe(df, use_container_width=True)
@@ -225,12 +308,48 @@ def render_summary_tab(analysis, uploaded_files):
         "정상 처리 파일 수": success_count,
         "실패 파일 수": fail_count,
         "추출 페이지 수": len(analysis.get("pages", [])),
-        "추출 문장 수": len(analysis["sentences"]),
+        "추출 문장 수": overlap["total_sentences"],
+        "겹친 문장 수": overlap["overlapped_sentences"],
+        "문장 겹침 비율(%)": overlap["overlap_ratio_pct"],
         "추출 이미지 수": len(analysis["images"]),
         "유사 페이지 쌍 수": len(analysis.get("page_pairs", [])),
         "유사 문장 쌍 수": len(analysis["sentence_pairs"]),
         "유사 이미지 쌍 수": len(analysis["image_pairs"]),
+        "매칭 페이지 PNG 수": len(analysis.get("matched_page_pngs") or []),
     }
+
+
+def render_matched_pages_tab(analysis):
+    """유사 문장이 포함된 페이지 PNG 미리보기·ZIP 다운로드."""
+    shots = analysis.get("matched_page_pngs") or []
+    if not shots:
+        st.info("유사 문장 쌍에서 추출할 페이지 스크린샷이 없습니다.")
+        return
+
+    st.caption(f"유사 문장이 있는 페이지 {len(shots)}장 (중복 페이지는 1장만 저장)")
+    meta = [{"파일": s["file_name"], "페이지": s["page_number"], "파일명": s["filename"]} for s in shots]
+    import pandas as pd
+
+    st.dataframe(pd.DataFrame(meta), use_container_width=True, hide_index=True)
+
+    zip_bytes = screenshots_to_zip(shots)
+    st.download_button(
+        "matched_pages.zip 다운로드",
+        data=zip_bytes,
+        file_name="matched_pages.zip",
+        mime="application/zip",
+    )
+
+    st.markdown("#### 미리보기")
+    for i, s in enumerate(shots[:30]):  # UI 과부하 방지
+        with st.expander(
+            f"{s['file_name']} · 페이지 {s['page_number']}",
+            expanded=(i == 0),
+        ):
+            st.image(s["png_bytes"], use_container_width=True)
+    if len(shots) > 30:
+        st.info(f"미리보기는 처음 30장만 표시합니다. 전체 {len(shots)}장은 ZIP으로 받으세요.")
+
 
 
 def render_page_tab(page_pairs):
@@ -414,8 +533,8 @@ def main():
     if analysis is None:
         return
 
-    tab_summary, tab_pages, tab_sentences, tab_images, tab_log = st.tabs(
-        ["분석 요약", "유사 페이지", "유사 문장", "유사 이미지", "처리 로그"]
+    tab_summary, tab_pages, tab_sentences, tab_images, tab_matched, tab_log = st.tabs(
+        ["분석 요약", "유사 페이지", "유사 문장", "유사 이미지", "매칭 페이지 PNG", "처리 로그"]
     )
 
     with tab_summary:
@@ -426,12 +545,14 @@ def main():
         render_sentence_tab(analysis["sentence_pairs"])
     with tab_images:
         render_image_tab(analysis["image_pairs"])
+    with tab_matched:
+        render_matched_pages_tab(analysis)
     with tab_log:
         render_log_tab(analysis["log_entries"])
 
     st.divider()
     st.subheader("결과 다운로드")
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         st.download_button(
             "similar_pages.csv",
@@ -454,6 +575,17 @@ def main():
             mime="text/csv",
         )
     with col4:
+        shots = analysis.get("matched_page_pngs") or []
+        if shots:
+            st.download_button(
+                "matched_pages.zip",
+                data=screenshots_to_zip(shots),
+                file_name="matched_pages.zip",
+                mime="application/zip",
+            )
+        else:
+            st.button("matched_pages.zip", disabled=True)
+    with col5:
         excel_bytes = build_excel_report(
             summary_dict,
             analysis["sentence_pairs"],

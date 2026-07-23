@@ -8,8 +8,16 @@
 이 모듈은 Streamlit에 의존하지 않습니다 (테스트 용이성을 위해).
 모델 캐싱(st.cache_resource)은 app.py에서 이 모듈의 load_model을 감싸서 처리합니다.
 """
+from __future__ import annotations
+
+import os
 from collections import defaultdict
 from typing import Optional
+
+# Transformers가 Keras 3와 충돌하지 않도록 TF 경로를 import 전에 비활성화
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+os.environ.setdefault("TRANSFORMERS_NO_FLAX", "1")
 
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
@@ -27,11 +35,20 @@ from src.utils.config import (
 
 def load_model(model_name: str):
     """sentence-transformers 모델을 로드합니다.
-    최초 실행 시 인터넷에서 모델을 내려받고, 이후에는 로컬 캐시(~/.cache)를 사용합니다.
+
+    Keras 3 / TensorFlow 충돌을 피하기 위해 PyTorch 백엔드만 사용합니다.
+    최초 실행 시 인터넷에서 모델을 내려받고, 이후에는 로컬 캐시를 사용합니다.
     """
+    os.environ["USE_TF"] = "0"
+    os.environ["TRANSFORMERS_NO_TF"] = "1"
+    os.environ["TRANSFORMERS_NO_FLAX"] = "1"
+
     from sentence_transformers import SentenceTransformer
 
-    return SentenceTransformer(model_name)
+    try:
+        return SentenceTransformer(model_name, backend="torch")
+    except TypeError:
+        return SentenceTransformer(model_name)
 
 
 def compute_embeddings(model, texts: list[str], batch_size: int = EMBEDDING_BATCH_SIZE) -> np.ndarray:
