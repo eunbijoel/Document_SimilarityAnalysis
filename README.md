@@ -62,9 +62,14 @@ flowchart LR
 ## 프로젝트 구조
 
 ```text
-app.py                 # Streamlit UI
+app.py                 # Streamlit UI (전체 흐름)
 requirements.txt
 src/
+├── features/          # 신규 기능 (수동 제외 · 자동 제외 복원)
+│   ├── manual_exclude.py
+│   └── excluded_restore.py
+├── ui/                # 탭 UI
+│   └── excluded_sentences_tab.py
 ├── parsers/           # PDF 파서 (+ 다른 형식 스텁)
 ├── analyzers/         # 문장·페이지·이미지 유사도
 ├── models/            # 데이터 스키마
