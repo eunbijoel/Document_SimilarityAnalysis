@@ -635,16 +635,11 @@ def render_matched_pages_tab(analysis):
         key="dl_matched_pages_tab",
     )
 
-    st.caption("노란색 하이라이트 = 해당 페이지에서 찾은 유사 문장 위치 (검색 실패 시 미표시).")
-    show_preview = st.checkbox(
-        "나란히 미리보기 표시 (이미지 많아 느릴 수 있음)",
-        value=False,
-        key="matched_pages_show_preview",
+    st.caption(
+        "노란색 하이라이트 = 이 페이지 쌍을 만들게 된 유사 문장들의 위치입니다. "
+        "A와 B에 같은 글자가 칠해질 필요는 없습니다 — 문장 유사도(의미/표현이 비슷함)로 묶입니다. "
+        "아래「묶인 근거」에서 A↔B로 짝지어진 문장을 확인하세요."
     )
-    if not show_preview:
-        st.info("미리보기는 꺼져 있습니다. 필요하면 위 체크박스를 켠 뒤 확인하세요. ZIP 다운로드는 바로 가능합니다.")
-        return
-
     st.markdown("#### 나란히 미리보기")
     for i, (label, item) in enumerate(list(pairs.items())[:30]):
         with st.expander(label, expanded=(i == 0)):
@@ -657,19 +652,36 @@ def render_matched_pages_tab(analysis):
                 )
                 st.caption(item.get("filename", ""))
                 st.image(item["png_bytes"], use_container_width=True)
-                ta, tb = item.get("texts_a") or [], item.get("texts_b") or []
-                if ta or tb:
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        if ta:
-                            with st.expander(f"A 하이라이트 문장 {len(ta)}개", expanded=False):
-                                for t in ta:
-                                    st.write(t)
-                    with c2:
-                        if tb:
-                            with st.expander(f"B 하이라이트 문장 {len(tb)}개", expanded=False):
-                                for t in tb:
-                                    st.write(t)
+                match_pairs = item.get("match_pairs") or []
+                with st.expander(
+                    f"이 페이지가 묶인 근거 — 유사 문장 쌍 {len(match_pairs) or item.get('pair_count', 0)}개",
+                    expanded=True,
+                ):
+                    if match_pairs:
+                        for j, mp in enumerate(match_pairs, 1):
+                            sim = mp.get("similarity")
+                            sim_s = f"{float(sim) * 100:.1f}%" if sim is not None else "-"
+                            st.markdown(
+                                f"**{j}.** 유사도 {sim_s}"
+                                + (f" · {mp.get('verdict')}" if mp.get("verdict") else "")
+                            )
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                st.caption("A")
+                                st.write(mp.get("text_a") or "")
+                            with c2:
+                                st.caption("B")
+                                st.write(mp.get("text_b") or "")
+                    else:
+                        ta, tb = item.get("texts_a") or [], item.get("texts_b") or []
+                        st.caption("상세 짝 정보가 없어 하이라이트 대상 문장만 표시합니다.")
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            for t in ta:
+                                st.write(t)
+                        with c2:
+                            for t in tb:
+                                st.write(t)
             else:
                 c1, c2 = st.columns(2)
                 with c1:
@@ -868,7 +880,7 @@ def render_excluded_tab(analysis):
                 )
 
     st.divider()
-    st.subheader("자동 제외 문장 (등장 파일 수 ≥ 2)")
+    st.subheader("자동 제외 문장")
 
     if not rows:
         st.info("자동 제외된 문장이 없습니다. (필터가 꺼져 있거나, 해당 문장이 없었습니다.)")

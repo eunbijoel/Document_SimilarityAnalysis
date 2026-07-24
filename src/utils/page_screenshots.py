@@ -231,10 +231,10 @@ def collect_matched_page_pairs(sentence_pairs: list[dict]) -> list[tuple[str, in
 
 def collect_matched_page_pair_details(sentence_pairs: list[dict]) -> list[dict]:
     """
-    페이지 쌍별로 하이라이트할 문장 텍스트를 모아 반환.
+    페이지 쌍별로 하이라이트할 문장과, 묶인 근거(유사 문장 쌍)를 모아 반환.
 
     Returns:
-        [{file_a, page_a, file_b, page_b, texts_a, texts_b, pair_count}, ...]
+        [{file_a, page_a, file_b, page_b, texts_a, texts_b, pair_count, match_pairs}, ...]
     """
     groups: OrderedDict[tuple[str, int, str, int], dict] = OrderedDict()
 
@@ -263,9 +263,18 @@ def collect_matched_page_pair_details(sentence_pairs: list[dict]) -> list[dict]:
                 "texts_a": [],
                 "texts_b": [],
                 "pair_count": 0,
+                "match_pairs": [],
             }
         g = groups[key]
         g["pair_count"] += 1
+        g["match_pairs"].append(
+            {
+                "text_a": text_a,
+                "text_b": text_b,
+                "similarity": p.get("similarity"),
+                "verdict": p.get("verdict") or "",
+            }
+        )
         if text_a and text_a not in g["texts_a"]:
             g["texts_a"].append(text_a)
         if text_b and text_b not in g["texts_b"]:
@@ -442,6 +451,7 @@ def build_matched_page_screenshots(
                         "hits_b": sides["B"].get("highlight_hits", 0),
                         "texts_a": texts_a,
                         "texts_b": texts_b,
+                        "match_pairs": d.get("match_pairs") or [],
                     }
                 )
     return results
