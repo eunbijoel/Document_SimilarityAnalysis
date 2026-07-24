@@ -217,6 +217,65 @@ def run_analysis(uploaded_files, settings):
     }
 
 
+def _thin_bar_chart(df, x_col: str, y_col: str, *, x_sort=None, height: int = 280):
+    """범주형 X축용 얇은 막대 그래프."""
+    import altair as alt
+
+    x_enc = alt.X(
+        f"{x_col}:N",
+        sort=x_sort,
+        axis=alt.Axis(labelAngle=0, labelLimit=160, title=x_col),
+        scale=alt.Scale(paddingInner=0.65, paddingOuter=0.25),
+    )
+    y_enc = alt.Y(f"{y_col}:Q", axis=alt.Axis(title=y_col))
+    chart = (
+        alt.Chart(df)
+        .mark_bar(size=18, cornerRadiusEnd=2)
+        .encode(x=x_enc, y=y_enc, tooltip=[x_col, y_col])
+        .properties(height=height)
+        .configure_view(strokeWidth=0)
+        .configure_axis(grid=True, gridOpacity=0.3)
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+
+def _similarity_hist_chart(df, *, height: int = 300):
+    """유사도 0.01 단위 히스토그램 (얇은 막대)."""
+    import altair as alt
+
+    if df is None or df.empty:
+        return
+
+    x_min = float(df["유사도"].min())
+    # 막대 너비 = 0.01 스케일 폭에 맞춤
+    chart = (
+        alt.Chart(df)
+        .mark_bar(size=2.5, cornerRadiusEnd=1)
+        .encode(
+            x=alt.X(
+                "유사도:Q",
+                scale=alt.Scale(domain=[max(0.0, x_min - 0.01), 1.0], nice=False),
+                axis=alt.Axis(
+                    title="유사도 (0.01 단위)",
+                    format=".2f",
+                    tickMinStep=0.01,
+                    values=[round(x_min + i * 0.05, 2) for i in range(int((1.0 - x_min) / 0.05) + 1)]
+                    + ([1.0] if abs(1.0 - x_min) > 1e-9 else []),
+                ),
+            ),
+            y=alt.Y("쌍 개수:Q", axis=alt.Axis(title="쌍 개수")),
+            tooltip=[
+                alt.Tooltip("유사도:Q", format=".2f"),
+                alt.Tooltip("쌍 개수:Q"),
+            ],
+        )
+        .properties(height=height)
+        .configure_view(strokeWidth=0)
+        .configure_axis(grid=True, gridOpacity=0.25)
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+
 def render_summary_tab(analysis, uploaded_files):
     import pandas as pd
 
@@ -250,15 +309,16 @@ def render_summary_tab(analysis, uploaded_files):
         st.markdown("**파일별 문장 겹침**")
         st.dataframe(per_file_df, use_container_width=True, hide_index=True)
 
-    # --- 2) 유사도 구간 분포 그래프 ---
+    # --- 2) 유사도 구간 분포 그래프 (0.01 단위) ---
     st.subheader("유사도 구간 분포 (문장 쌍)")
-    dist_df = analysis.get("similarity_distribution")
-    if dist_df is None or (hasattr(dist_df, "empty") and dist_df.empty):
-        dist_df = compute_similarity_distribution(analysis["sentence_pairs"])
+    # 세션에 옛(0.1대) 포맷이 남아 있어도 항상 0.01 단위로 재계산
+    dist_df = compute_similarity_distribution(analysis["sentence_pairs"])
     if dist_df is not None and not dist_df.empty:
-        st.dataframe(dist_df, use_container_width=True, hide_index=True)
-        st.bar_chart(dist_df, x="유사도 구간", y="쌍 개수")
-        st.caption("X축: 유사도 구간(1.0 / 0.9대 / …) · Y축: 해당 구간 쌍 개수")
+        # 표는 쌍이 있는 구간만 (가독성)
+        nonzero = dist_df[dist_df["쌍 개수"] > 0].reset_index(drop=True)
+        st.dataframe(nonzero, use_container_width=True, hide_index=True)
+        _similarity_hist_chart(dist_df)
+        st.caption("X축: 유사도 0.01 단위 · Y축: 해당 유사도 쌍 개수")
     else:
         st.info("유사 문장 쌍이 없어 분포를 그릴 수 없습니다.")
 
@@ -271,12 +331,11 @@ def render_summary_tab(analysis, uploaded_files):
     if matrix is not None and not matrix.empty:
         st.dataframe(matrix, use_container_width=True)
         st.caption("행·열 = 파일명, 칸 값 = 두 파일 사이 유사 문장 쌍 개수 (파일이 늘면 행/열이 늘어납니다).")
-        # bar_chart는 index 이름에 특수문자(\\ 등)가 있으면 오류가 나므로 안전하게 정리
         participation = matrix.sum(axis=1).astype(int)
         chart_df = pd.DataFrame(
             {"파일": participation.index.astype(str), "유사쌍_참여수": participation.values}
         )
-        st.bar_chart(chart_df, x="파일", y="유사쌍_참여수")
+        _thin_bar_chart(chart_df, "파일", "유사쌍_참여수")
         st.caption("파일별 유사 문장 쌍 참여 횟수 합계")
     else:
         st.info("파일 매트릭스를 만들 데이터가 없습니다.")

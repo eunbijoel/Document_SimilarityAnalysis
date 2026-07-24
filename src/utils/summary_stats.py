@@ -76,22 +76,55 @@ def compute_sentence_overlap_stats(
     }
 
 
-def similarity_bin_label(score: float) -> str:
-    """유사도 점수를 구간 라벨로 변환 (1.0 / 0.9대 / 0.8대 …)."""
-    if score >= 0.999:
-        return "1.0 (동일)"
-    if score >= 0.90:
-        return "0.9대"
-    if score >= 0.80:
-        return "0.8대"
-    if score >= 0.70:
-        return "0.7대"
-    if score >= 0.60:
-        return "0.6대"
-    return "0.6 미만"
+def similarity_bin_001(score: float, step: float = 0.01) -> float:
+    """유사도를 0.01 단위 구간으로 반올림 (예: 0.856 → 0.86)."""
+    score = max(0.0, min(1.0, float(score)))
+    binned = round(round(score / step) * step, 2)
+    return min(1.0, binned)
 
 
-# 그래프용 고정 순서
+def compute_similarity_distribution(
+    pairs: list[dict],
+    score_key: str = "similarity",
+    step: float = 0.01,
+    fill_empty: bool = True,
+) -> pd.DataFrame:
+    """유사도 0.01 단위 구간별 쌍 개수 DataFrame (차트용)."""
+    counts: Counter = Counter()
+    for pair in pairs:
+        score = float(pair.get(score_key, 0.0))
+        counts[similarity_bin_001(score, step=step)] += 1
+
+    if not counts:
+        return pd.DataFrame(columns=["유사도", "쌍 개수"])
+
+    if fill_empty:
+        start = min(counts.keys())
+        # 시작~1.00까지 0.01 간격으로 채움 (빈 구간은 0)
+        rows = []
+        x = start
+        # 부동소수 누적 오차 방지
+        n_steps = int(round((1.0 - start) / step))
+        for i in range(n_steps + 1):
+            x_r = round(start + i * step, 2)
+            if x_r > 1.0:
+                x_r = 1.0
+            rows.append({"유사도": x_r, "쌍 개수": int(counts.get(x_r, 0))})
+        # 1.00이 빠졌으면 추가
+        if rows and rows[-1]["유사도"] < 1.0 and 1.0 in counts:
+            rows.append({"유사도": 1.0, "쌍 개수": int(counts.get(1.0, 0))})
+        elif rows and rows[-1]["유사도"] < 1.0:
+            rows.append({"유사도": 1.0, "쌍 개수": int(counts.get(1.0, 0))})
+        return pd.DataFrame(rows)
+
+    rows = [
+        {"유사도": k, "쌍 개수": v}
+        for k, v in sorted(counts.items())
+    ]
+    return pd.DataFrame(rows)
+
+
+# 하위 호환용 (이전 0.1대 라벨 — UI에서는 더 이상 사용하지 않음)
 SIMILARITY_BIN_ORDER = [
     "1.0 (동일)",
     "0.9대",
@@ -100,24 +133,6 @@ SIMILARITY_BIN_ORDER = [
     "0.6대",
     "0.6 미만",
 ]
-
-
-def compute_similarity_distribution(pairs: list[dict], score_key: str = "similarity") -> pd.DataFrame:
-    """유사도 구간별 쌍 개수 DataFrame (차트용)."""
-    counts: Counter = Counter()
-    for pair in pairs:
-        score = float(pair.get(score_key, 0.0))
-        counts[similarity_bin_label(score)] += 1
-
-    rows = [
-        {"유사도 구간": label, "쌍 개수": counts.get(label, 0)}
-        for label in SIMILARITY_BIN_ORDER
-        if counts.get(label, 0) > 0 or label in ("1.0 (동일)", "0.9대", "0.8대")
-    ]
-    # 값이 있는 구간만 + 상위 3구간은 0이어도 표시
-    if not any(r["쌍 개수"] for r in rows):
-        return pd.DataFrame(columns=["유사도 구간", "쌍 개수"])
-    return pd.DataFrame(rows)
 
 
 def compute_file_pair_matrix(
