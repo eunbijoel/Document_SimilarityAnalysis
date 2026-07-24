@@ -636,6 +636,15 @@ def render_matched_pages_tab(analysis):
     )
 
     st.caption("노란색 하이라이트 = 해당 페이지에서 찾은 유사 문장 위치 (검색 실패 시 미표시).")
+    show_preview = st.checkbox(
+        "나란히 미리보기 표시 (이미지 많아 느릴 수 있음)",
+        value=False,
+        key="matched_pages_show_preview",
+    )
+    if not show_preview:
+        st.info("미리보기는 꺼져 있습니다. 필요하면 위 체크박스를 켠 뒤 확인하세요. ZIP 다운로드는 바로 가능합니다.")
+        return
+
     st.markdown("#### 나란히 미리보기")
     for i, (label, item) in enumerate(list(pairs.items())[:30]):
         with st.expander(label, expanded=(i == 0)):
@@ -775,35 +784,42 @@ def render_excluded_tab(analysis):
     stats = analysis.get("boilerplate_stats") or {}
     multi = [r for r in rows if int(r.get("file_count") or 0) >= 2]
 
-    # --- 수동 제외 (텍스트 입력) ---
+    # --- 수동 제외: form으로 묶어 입력 중 재실행 방지 ---
     st.subheader("수동 제외 (단어·문장 입력)")
     st.caption(
-        "한 줄에 하나(또는 쉼표로 구분) 입력하세요. "
-        "해당 문구가 포함된 유사 문장 쌍은 결과·통계·페이지 PNG·다운로드에서 제외됩니다."
+        "한 줄에 하나(또는 쉼표로 구분). 「적용」을 누를 때만 결과에서 제외합니다."
     )
-    if "manual_exclude_text" not in st.session_state:
-        st.session_state["manual_exclude_text"] = ""
-    raw_text = st.text_area(
-        "제외할 단어 또는 문장",
-        height=120,
-        placeholder="예:\n주관연구개발기관\n공동연구개발기관\n한국전자기술연구원",
-        key="manual_exclude_text",
-    )
-    b1, b2, _ = st.columns([1, 1, 2])
-    apply_manual = b1.button("입력 문구로 결과 제외", type="primary", key="manual_exclude_apply")
-    clear_manual = b2.button("수동 제외 해제", key="manual_exclude_clear")
+    with st.form("manual_exclude_form", clear_on_submit=False):
+        raw_text = st.text_area(
+            "제외할 단어 또는 문장",
+            height=100,
+            placeholder="예:\n주관연구개발기관\n공동연구개발기관",
+            key="manual_exclude_text",
+        )
+        c1, c2, _ = st.columns([1, 1, 2])
+        apply_manual = c1.form_submit_button("입력 문구로 결과 제외", type="primary")
+        clear_manual = c2.form_submit_button("수동 제외 해제")
 
     if clear_manual:
         st.session_state.pop("manual_exclude_terms", None)
         st.session_state.pop("manual_exclude_view", None)
         st.session_state["manual_exclude_text"] = ""
         base_pairs = analysis.get("sentence_pairs_base") or analysis.get("sentence_pairs") or []
+        # PNG 전체 재생성은 무거우므로 ZIP만 비우고, 다음 다운로드/탭에서 필요 시 생성
         details = collect_matched_page_pair_details(base_pairs)
         pdf_bytes = analysis.get("pdf_bytes_by_name") or {}
-        shots = []
-        if pdf_bytes and base_pairs:
-            shots = build_matched_page_screenshots(pdf_bytes, details, dpi=120)
-        st.session_state["matched_pages_zip"] = screenshots_to_zip(shots) if shots else None
+        shots = analysis.get("matched_page_pngs") or []
+        # base pairs 기준으로 analysis에 이미 있는 pnghots 재사용 시도
+        if not shots and pdf_bytes and base_pairs:
+            with st.spinner("페이지 PNG 복원 중..."):
+                shots = build_matched_page_screenshots(pdf_bytes, details, dpi=120)
+                analysis_u = dict(analysis)
+                analysis_u["matched_page_pngs"] = shots
+                analysis_u["sentence_pairs"] = base_pairs
+                st.session_state["analysis"] = analysis_u
+        st.session_state["matched_pages_zip"] = (
+            screenshots_to_zip(shots) if shots else None
+        )
         st.rerun()
 
     if apply_manual:
@@ -866,8 +882,8 @@ def render_excluded_tab(analysis):
         "등장 1회 문장은 표시하지 않습니다."
     )
     st.info(
-        "아래 목록에서 선택한 문장은 **유사 문장 비교에 다시 포함**할 수 있습니다. "
-        "결과에서 빼고 싶은 단어/문장은 위 수동 제외 입력을 사용하세요."
+        "목록에서 고른 뒤 「다시 포함」을 누를 때만 재계산합니다. "
+        "(항목을 고르는 동안에는 페이지가 다시 돌지 않습니다.)"
     )
 
     groups: OrderedDict[str, dict] = OrderedDict()
@@ -887,62 +903,48 @@ def render_excluded_tab(analysis):
             groups[key]["file_count"], int(r.get("file_count") or 0)
         )
 
-    reason_opts = sorted({g["reason"] for g in groups.values() if g["reason"]})
-    reason_filter = st.multiselect(
-        "제외 사유 필터",
-        options=reason_opts,
-        default=reason_opts,
-        key="excluded_reason_filter",
-    )
-    visible = [
-        (k, g)
-        for k, g in groups.items()
-        if not reason_filter or g["reason"] in reason_filter
-    ]
-
-    prev = set(st.session_state.get("restore_selected_texts") or [])
-    st.markdown("**결과에 다시 포함할 문장**")
-    if not visible:
+    if not groups:
         st.warning("표시할 유의미 중복 제외 문장이 없습니다.")
     else:
-        checked_keys: list[str] = []
-        show_n = min(len(visible), 80)
-        for i, (key, g) in enumerate(visible[:show_n]):
+        # 사유 필터는 form 밖 — 옵션 목록만 좁히고, 선택 자체는 form 안에서 재실행 없이
+        reason_opts = sorted({g["reason"] for g in groups.values() if g["reason"]})
+        reason_filter = st.multiselect(
+            "제외 사유 필터",
+            options=reason_opts,
+            default=reason_opts,
+            key="excluded_reason_filter",
+        )
+
+        label_to_key: dict[str, str] = {}
+        labels: list[str] = []
+        for key, g in groups.items():
+            if reason_filter and g["reason"] not in reason_filter:
+                continue
             label = (
-                f"[{g['reason']}] (파일 {g['file_count']}개) {g['text'][:120]}"
-                + ("…" if len(g["text"]) > 120 else "")
+                f"[{g['reason']}] (파일{g['file_count']}) {g['text'][:100]}"
+                + ("…" if len(g["text"]) > 100 else "")
             )
-            on = st.checkbox(
-                label,
-                value=(key in prev),
-                key=f"restore_cb_{abs(hash(key)) % 10_000_000}",
+            if label in label_to_key:
+                label = f"{label} · {key[:20]}"
+            label_to_key[label] = key
+            labels.append(label)
+
+        with st.form("restore_excluded_form"):
+            st.caption(
+                f"선택 가능 {len(labels)}개 · 검색어로 좁힌 뒤 여러 개 선택하고 "
+                "「다시 포함」을 누르세요. (선택 중에는 재실행되지 않습니다)"
             )
-            if on:
-                checked_keys.append(key)
-        if len(visible) > show_n:
-            with st.expander(f"나머지 {len(visible) - show_n}개 더 보기", expanded=False):
-                for key, g in visible[show_n:]:
-                    label = (
-                        f"[{g['reason']}] (파일 {g['file_count']}개) {g['text'][:120]}"
-                        + ("…" if len(g["text"]) > 120 else "")
-                    )
-                    on = st.checkbox(
-                        label,
-                        value=(key in prev),
-                        key=f"restore_cb_{abs(hash(key)) % 10_000_000}",
-                    )
-                    if on:
-                        checked_keys.append(key)
+            selected_labels = st.multiselect(
+                "결과에 다시 포함할 문장",
+                options=labels,
+                default=[],
+            )
+            submitted = st.form_submit_button(
+                "선택 문장 결과에 다시 포함", type="primary"
+            )
 
-        c1, c2 = st.columns([1, 1])
-        apply = c1.button("선택 문장 결과에 다시 포함", type="primary", key="restore_apply")
-        clear = c2.button("선택 해제", key="restore_clear")
-
-        if clear:
-            st.session_state["restore_selected_texts"] = []
-            st.rerun()
-
-        if apply:
+        if submitted:
+            checked_keys = [label_to_key[lb] for lb in selected_labels if lb in label_to_key]
             if not checked_keys:
                 st.warning("다시 포함할 문장을 하나 이상 선택하세요.")
             else:
@@ -989,9 +991,7 @@ def render_excluded_tab(analysis):
                 analysis_new.update(updated)
                 analysis_new["excluded_sentences"] = remaining_excluded
                 st.session_state["analysis"] = analysis_new
-                st.session_state["restore_selected_texts"] = []
                 st.session_state["excluded_restore_applied"] = checked_keys
-                # 수동 제외는 base가 바뀌었으므로 재적용 필요 → 일단 해제
                 st.session_state.pop("manual_exclude_view", None)
                 st.session_state.pop("manual_exclude_terms", None)
                 shots = updated.get("matched_page_pngs") or []
@@ -1003,8 +1003,6 @@ def render_excluded_tab(analysis):
                     f"유사 문장 쌍 {len(updated.get('sentence_pairs') or [])}개"
                 )
                 st.rerun()
-
-        st.session_state["restore_selected_texts"] = checked_keys
 
     if multi:
         st.markdown("#### 유의미 중복 제외 목록 (표)")
