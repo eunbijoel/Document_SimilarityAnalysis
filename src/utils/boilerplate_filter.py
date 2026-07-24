@@ -48,6 +48,10 @@ REASON_PATTERN = "양식 패턴"
 REASON_LABEL = "라벨형"
 REASON_COMMON = "파일공통"
 
+# 파일공통 제외는 '짧은 양식 라벨'에만 적용.
+# 긴 기술 문장이 여러 파일에 동일하게 있어도 유사 검토 대상이므로 남긴다.
+DEFAULT_COMMON_MAX_LENGTH = 20
+
 
 def common_file_threshold(n_files: int) -> int:
     """
@@ -107,6 +111,26 @@ def is_boilerplate_pattern(text: str) -> bool:
     return False
 
 
+def is_short_common_candidate(text: str, max_length: int = DEFAULT_COMMON_MAX_LENGTH) -> bool:
+    """
+    파일공통 필터 대상인지 판별.
+
+    여러 파일에 같아도, 짧은 항목명·단위·헤더만 제외하고
+    본문급 기술 문장은 유사 문장 결과에 남긴다.
+    """
+    t = (text or "").strip()
+    if not t:
+        return True
+    # 개조식 앞머리 제거 후 길이 판단
+    body = re.sub(r"^[ㅇ\-–•·]\s*", "", t).strip()
+    if len(body) <= max_length:
+        return True
+    # 길어도 라벨형이면 제외 후보
+    if is_label_like(body):
+        return True
+    return False
+
+
 def build_text_file_index(sentences: Iterable[SentenceRecord]) -> dict[str, set[str]]:
     """정규화 문장 → 등장 파일명 집합."""
     index: dict[str, set[str]] = defaultdict(set)
@@ -118,12 +142,17 @@ def build_text_file_index(sentences: Iterable[SentenceRecord]) -> dict[str, set[
 
 
 def _excluded_row(s: SentenceRecord, reason: str, *, file_count: int = 0) -> dict:
+    norm = (s.normalized_text or s.text or "").strip()
     return {
         "file_name": s.file_name,
+        "file_type": getattr(s, "file_type", "pdf") or "pdf",
         "location": s.location,
         "text": s.text,
+        "normalized_text": norm,
+        "sentence_id": s.sentence_id or "",
         "reason": reason,
         "file_count": file_count,
+        "row_id": f"{s.file_name}||{s.location}||{norm}",
     }
 
 
@@ -133,9 +162,12 @@ def filter_boilerplate_sentences(
     n_files: int,
     use_patterns: bool = True,
     use_common_across_files: bool = True,
+    common_max_length: int = DEFAULT_COMMON_MAX_LENGTH,
 ) -> tuple[list[SentenceRecord], dict, list[dict]]:
     """
     양식/공통 문장을 걸러낸다.
+
+    파일공통은 common_max_length 이하의 짧은 문구(또는 라벨형)에만 적용한다.
 
     Returns:
         (남은 문장, 통계 dict, 제외 문장 목록)
@@ -147,6 +179,7 @@ def filter_boilerplate_sentences(
         "removed_common": 0,
         "kept": 0,
         "common_threshold": common_file_threshold(n_files),
+        "common_max_length": common_max_length,
         "n_files": n_files,
     }
     excluded: list[dict] = []
@@ -172,7 +205,11 @@ def filter_boilerplate_sentences(
             stats["removed_label"] += 1
             excluded.append(_excluded_row(s, REASON_LABEL, file_count=len(files)))
             continue
-        if use_common_across_files and len(files) >= threshold:
+        if (
+            use_common_across_files
+            and len(files) >= threshold
+            and is_short_common_candidate(text, max_length=common_max_length)
+        ):
             stats["removed_common"] += 1
             excluded.append(_excluded_row(s, REASON_COMMON, file_count=len(files)))
             continue

@@ -45,12 +45,14 @@ from src.utils.summary_stats import (
     compute_similarity_distribution,
     compute_file_pair_matrix,
 )
+from src.utils.boilerplate_filter import filter_boilerplate_sentences
+from src.utils.result_word_filter import filter_pairs_by_words
 from src.utils.page_screenshots import (
     build_matched_page_screenshots,
     screenshots_to_zip,
     collect_matched_page_pair_details,
 )
-from src.utils.boilerplate_filter import filter_boilerplate_sentences
+from src.models.schemas import SentenceRecord
 
 st.set_page_config(page_title="문서 간 유사 콘텐츠 분석기", layout="wide")
 
@@ -63,6 +65,127 @@ def get_model():
 def friendly_error(exc: Exception) -> str:
     """개발자용 traceback 대신 사용자에게 보여줄 간단한 오류 메시지를 만듭니다."""
     return f"{type(exc).__name__}: {exc}"
+
+
+def _reset_result_filter_state():
+    for key in (
+        "matched_pages_zip",
+        "restore_selected_texts",
+        "excluded_restore_applied",
+        "manual_exclude_terms",
+        "manual_exclude_view",
+        "manual_exclude_text",
+    ):
+        st.session_state.pop(key, None)
+
+
+def parse_manual_exclude_terms(raw: str) -> list[str]:
+    """줄바꿈·쉼표로 구분된 제외 문구를 파싱."""
+    terms: list[str] = []
+    seen: set[str] = set()
+    for line in (raw or "").replace(",", "\n").splitlines():
+        w = line.strip()
+        if not w or w in seen:
+            continue
+        seen.add(w)
+        terms.append(w)
+    return terms
+
+
+def build_manual_exclude_view(analysis: dict, terms: list[str]) -> dict:
+    """수동 입력 문구가 포함된 유사 문장 쌍을 결과·통계·PNG에서 제외."""
+    base_pairs = analysis.get("sentence_pairs_base") or analysis.get("sentence_pairs") or []
+    kept, removed = filter_pairs_by_words(base_pairs, terms)
+    file_names = analysis.get("file_names") or []
+    overlap = compute_sentence_overlap_stats(analysis.get("sentences") or [], kept)
+    sim_dist = compute_similarity_distribution(kept)
+    file_matrix = compute_file_pair_matrix(kept, file_names)
+    pdf_bytes = analysis.get("pdf_bytes_by_name") or {}
+    details = collect_matched_page_pair_details(kept)
+    matched_pngs = (
+        build_matched_page_screenshots(pdf_bytes, details, dpi=120) if pdf_bytes else []
+    )
+    return {
+        "sentence_pairs": kept,
+        "overlap_stats": overlap,
+        "similarity_distribution": sim_dist,
+        "file_matrix": file_matrix,
+        "matched_page_pngs": matched_pngs,
+        "manual_excluded_pairs": removed,
+        "manual_exclude_terms": list(terms),
+    }
+
+
+def merge_display_analysis(analysis: dict) -> dict:
+    view = st.session_state.get("manual_exclude_view")
+    if not view:
+        return analysis
+    merged = dict(analysis)
+    merged.update(view)
+    return merged
+
+
+def _row_to_sentence(row: dict) -> SentenceRecord:
+    text = row.get("text") or ""
+    norm = (row.get("normalized_text") or text).strip()
+    return SentenceRecord(
+        file_name=row.get("file_name") or "",
+        file_type=row.get("file_type") or "pdf",
+        location=row.get("location") or "",
+        text=text,
+        normalized_text=norm,
+        sentence_id=row.get("sentence_id") or "",
+    )
+
+
+def recompute_sentence_side(analysis: dict, sentences: list[SentenceRecord], settings: dict) -> dict:
+    """문장 목록으로 유사 문장·통계·페이지 PNG만 다시 계산한다."""
+    sentence_pairs: list[dict] = []
+    model = None
+    try:
+        model = get_model()
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"문장 임베딩 모델 로딩 중 오류: {friendly_error(exc)}")
+
+    if model is not None and len(sentences) >= 2:
+        exact_pairs, exact_keys = find_exact_duplicate_pairs(
+            sentences, include_same_file=settings.get("include_same_file", False)
+        )
+        sentence_pairs.extend(exact_pairs)
+        try:
+            similar_pairs = find_similar_sentence_pairs(
+                sentences,
+                model,
+                threshold=settings.get("sentence_threshold", DEFAULT_SENTENCE_THRESHOLD),
+                include_same_file=settings.get("include_same_file", False),
+                already_found=exact_keys,
+            )
+            sentence_pairs.extend(similar_pairs)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"문장 유사도 분석 오류: {friendly_error(exc)}")
+
+    sentence_pairs.sort(key=lambda p: p["similarity"], reverse=True)
+    max_results = int(settings.get("max_results", DEFAULT_MAX_RESULTS))
+    sentence_pairs = sentence_pairs[:max_results]
+
+    file_names = analysis.get("file_names") or []
+    overlap = compute_sentence_overlap_stats(sentences, sentence_pairs)
+    sim_dist = compute_similarity_distribution(sentence_pairs)
+    file_matrix = compute_file_pair_matrix(sentence_pairs, file_names)
+    pdf_bytes = analysis.get("pdf_bytes_by_name") or {}
+    details = collect_matched_page_pair_details(sentence_pairs)
+    matched_pngs = (
+        build_matched_page_screenshots(pdf_bytes, details, dpi=120) if pdf_bytes else []
+    )
+    return {
+        "sentences": sentences,
+        "sentence_pairs": sentence_pairs,
+        "sentence_pairs_base": sentence_pairs,
+        "overlap_stats": overlap,
+        "similarity_distribution": sim_dist,
+        "file_matrix": file_matrix,
+        "matched_page_pngs": matched_pngs,
+    }
 
 
 def run_analysis(uploaded_files, settings):
@@ -133,6 +256,7 @@ def run_analysis(uploaded_files, settings):
             n_files=n_files,
             use_patterns=bool(settings.get("exclude_boilerplate_patterns", True)),
             use_common_across_files=bool(settings.get("exclude_common_sentences", True)),
+            common_max_length=int(settings.get("common_max_length", 20)),
         )
         removed = boilerplate_stats.get("removed_total", 0)
         if removed:
@@ -238,6 +362,7 @@ def run_analysis(uploaded_files, settings):
         "images": all_images,
         "pages": all_pages,
         "sentence_pairs": sentence_pairs,
+        "sentence_pairs_base": list(sentence_pairs),
         "page_pairs": page_pairs,
         "image_pairs": image_pairs,
         "log_entries": log_entries,
@@ -312,7 +437,7 @@ def _similarity_hist_chart(df, *, height: int = 300):
     st.altair_chart(chart, use_container_width=True)
 
 
-def render_summary_tab(analysis, uploaded_files):
+def render_summary_tab(analysis, file_count: int | None = None):
     import pandas as pd
 
     log_entries = analysis["log_entries"]
@@ -321,10 +446,18 @@ def render_summary_tab(analysis, uploaded_files):
     overlap = analysis.get("overlap_stats") or compute_sentence_overlap_stats(
         analysis["sentences"], analysis["sentence_pairs"]
     )
+    names = analysis.get("file_names") or []
+    n_files = file_count if file_count is not None else len(names)
+
+    st.subheader("처리 로그")
+    if log_entries:
+        st.dataframe(pd.DataFrame(log_entries), use_container_width=True, hide_index=True)
+    else:
+        st.info("처리 로그가 없습니다.")
 
     st.subheader("기본 지표")
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("파일 수", len(uploaded_files))
+    col1.metric("파일 수", n_files)
     col1.metric("정상 처리", success_count)
     col2.metric("실패", fail_count)
     col2.metric("추출 페이지", len(analysis.get("pages", [])))
@@ -371,7 +504,7 @@ def render_summary_tab(analysis, uploaded_files):
     st.subheader("파일 × 파일 유사 문장 쌍 수")
     matrix = analysis.get("file_matrix")
     if matrix is None or (hasattr(matrix, "empty") and matrix.empty):
-        names = analysis.get("file_names") or [f.name for f in uploaded_files]
+        names = analysis.get("file_names") or []
         matrix = compute_file_pair_matrix(analysis["sentence_pairs"], names)
     if matrix is not None and not matrix.empty:
         st.dataframe(matrix, use_container_width=True)
@@ -408,7 +541,7 @@ def render_summary_tab(analysis, uploaded_files):
         st.info("발견된 유사 항목이 없습니다.")
 
     return {
-        "파일 수": len(uploaded_files),
+        "파일 수": n_files,
         "정상 처리 파일 수": success_count,
         "실패 파일 수": fail_count,
         "추출 페이지 수": len(analysis.get("pages", [])),
@@ -424,91 +557,128 @@ def render_summary_tab(analysis, uploaded_files):
 
 
 def render_matched_pages_tab(analysis):
-    """유사 문장이 포함된 페이지 PNG — 파일A p.X = 파일B p.Y 이름으로 저장."""
+    """유사 문장이 포함된 페이지 PNG — 나란히 합본으로 미리보기·ZIP 다운로드."""
     shots = analysis.get("matched_page_pngs") or []
     if not shots:
         st.info("유사 문장 쌍에서 추출할 페이지 스크린샷이 없습니다.")
         return
 
-    # pair_label 기준으로 묶기
     from collections import OrderedDict
 
+    # 합본(AB) 우선, 없으면 A/B로 묶기
+    combined = [s for s in shots if s.get("side") == "AB"]
     pairs: OrderedDict = OrderedDict()
-    for s in shots:
-        label = s.get("pair_label") or f"{s['file_name']} p.{s['page_number']}"
-        pairs.setdefault(label, {"A": None, "B": None, "meta": s})
-        pairs[label][s.get("side", "A")] = s
+    if combined:
+        for s in combined:
+            label = s.get("pair_label") or f"{s.get('file_a')} = {s.get('file_b')}"
+            pairs[label] = s
+    else:
+        sides_map: OrderedDict = OrderedDict()
+        for s in shots:
+            label = s.get("pair_label") or f"{s['file_name']} p.{s['page_number']}"
+            sides_map.setdefault(label, {"A": None, "B": None, "meta": s})
+            sides_map[label][s.get("side", "A")] = s
+        for label, sides in sides_map.items():
+            pairs[label] = sides
 
     st.caption(
-        f"유사 문장 페이지 쌍 {len(pairs)}개 "
-        f"(파일명 예: `파일A_p0003=파일B_p0012__A.png`)"
+        f"유사 문장 페이지 쌍 {len(pairs)}개 · "
+        "ZIP에는 A|B를 나란히 합친 이미지 1장씩 들어갑니다 "
+        "(파일명 예: `파일A_p0003=파일B_p0012.png`)."
     )
 
     import pandas as pd
 
     meta_rows = []
-    for label, sides in pairs.items():
-        meta = sides["meta"]
-        a, b = sides.get("A") or {}, sides.get("B") or {}
-        meta_rows.append(
-            {
-                "비교": label,
-                "파일 A": meta.get("file_a", ""),
-                "페이지 A": meta.get("page_a", ""),
-                "하이라이트 A": a.get("highlight_hits", 0),
-                "파일 B": meta.get("file_b", ""),
-                "페이지 B": meta.get("page_b", ""),
-                "하이라이트 B": b.get("highlight_hits", 0),
-                "유사문장쌍": meta.get("pair_count", a.get("pair_count", "")),
-                "파일명 A": a.get("filename", ""),
-                "파일명 B": b.get("filename", ""),
-            }
-        )
+    for label, item in pairs.items():
+        if isinstance(item, dict) and item.get("side") == "AB":
+            meta_rows.append(
+                {
+                    "비교": label,
+                    "파일 A": item.get("file_a", ""),
+                    "페이지 A": item.get("page_a", ""),
+                    "하이라이트 A": item.get("hits_a", 0),
+                    "파일 B": item.get("file_b", ""),
+                    "페이지 B": item.get("page_b", ""),
+                    "하이라이트 B": item.get("hits_b", 0),
+                    "유사문장쌍": item.get("pair_count", ""),
+                    "다운로드 파일": item.get("filename", ""),
+                }
+            )
+        else:
+            meta = item.get("meta", item)
+            a, b = item.get("A") or {}, item.get("B") or {}
+            meta_rows.append(
+                {
+                    "비교": label,
+                    "파일 A": meta.get("file_a", ""),
+                    "페이지 A": meta.get("page_a", ""),
+                    "하이라이트 A": a.get("highlight_hits", 0),
+                    "파일 B": meta.get("file_b", ""),
+                    "페이지 B": meta.get("page_b", ""),
+                    "하이라이트 B": b.get("highlight_hits", 0),
+                    "유사문장쌍": meta.get("pair_count", a.get("pair_count", "")),
+                    "다운로드 파일": "",
+                }
+            )
     st.dataframe(pd.DataFrame(meta_rows), use_container_width=True, hide_index=True)
 
-    zip_bytes = screenshots_to_zip(shots)
+    zip_bytes = st.session_state.get("matched_pages_zip")
+    if zip_bytes is None:
+        zip_bytes = screenshots_to_zip(shots, combined_only=True)
+        st.session_state["matched_pages_zip"] = zip_bytes
     st.download_button(
-        "matched_pages.zip 다운로드",
+        "matched_pages.zip 다운로드 (나란히 합본)",
         data=zip_bytes,
         file_name="matched_pages.zip",
         mime="application/zip",
+        key="dl_matched_pages_tab",
     )
 
     st.caption("노란색 하이라이트 = 해당 페이지에서 찾은 유사 문장 위치 (검색 실패 시 미표시).")
     st.markdown("#### 나란히 미리보기")
-    for i, (label, sides) in enumerate(list(pairs.items())[:30]):
+    for i, (label, item) in enumerate(list(pairs.items())[:30]):
         with st.expander(label, expanded=(i == 0)):
-            c1, c2 = st.columns(2)
-            with c1:
-                a = sides.get("A")
-                if a:
-                    hits = a.get("highlight_hits", 0)
-                    st.markdown(
-                        f"**A:** {a['file_name']} · 페이지 {a['page_number']} "
-                        f"(하이라이트 {hits}곳)"
-                    )
-                    st.caption(a["filename"])
-                    st.image(a["png_bytes"], use_container_width=True)
-                    texts = a.get("highlight_texts") or []
-                    if texts:
-                        with st.expander(f"하이라이트 대상 문장 {len(texts)}개", expanded=False):
-                            for t in texts:
-                                st.write(t)
-            with c2:
-                b = sides.get("B")
-                if b:
-                    hits = b.get("highlight_hits", 0)
-                    st.markdown(
-                        f"**B:** {b['file_name']} · 페이지 {b['page_number']} "
-                        f"(하이라이트 {hits}곳)"
-                    )
-                    st.caption(b["filename"])
-                    st.image(b["png_bytes"], use_container_width=True)
-                    texts = b.get("highlight_texts") or []
-                    if texts:
-                        with st.expander(f"하이라이트 대상 문장 {len(texts)}개", expanded=False):
-                            for t in texts:
-                                st.write(t)
+            if isinstance(item, dict) and item.get("side") == "AB":
+                st.markdown(
+                    f"**A:** {item.get('file_a')} · p.{item.get('page_a')} "
+                    f"(하이라이트 {item.get('hits_a', 0)}곳) &nbsp;|&nbsp; "
+                    f"**B:** {item.get('file_b')} · p.{item.get('page_b')} "
+                    f"(하이라이트 {item.get('hits_b', 0)}곳)"
+                )
+                st.caption(item.get("filename", ""))
+                st.image(item["png_bytes"], use_container_width=True)
+                ta, tb = item.get("texts_a") or [], item.get("texts_b") or []
+                if ta or tb:
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if ta:
+                            with st.expander(f"A 하이라이트 문장 {len(ta)}개", expanded=False):
+                                for t in ta:
+                                    st.write(t)
+                    with c2:
+                        if tb:
+                            with st.expander(f"B 하이라이트 문장 {len(tb)}개", expanded=False):
+                                for t in tb:
+                                    st.write(t)
+            else:
+                c1, c2 = st.columns(2)
+                with c1:
+                    a = item.get("A")
+                    if a:
+                        st.markdown(
+                            f"**A:** {a['file_name']} · 페이지 {a['page_number']} "
+                            f"(하이라이트 {a.get('highlight_hits', 0)}곳)"
+                        )
+                        st.image(a["png_bytes"], use_container_width=True)
+                with c2:
+                    b = item.get("B")
+                    if b:
+                        st.markdown(
+                            f"**B:** {b['file_name']} · 페이지 {b['page_number']} "
+                            f"(하이라이트 {b.get('highlight_hits', 0)}곳)"
+                        )
+                        st.image(b["png_bytes"], use_container_width=True)
     if len(pairs) > 30:
         st.info(f"미리보기는 처음 30쌍만 표시합니다. 전체 {len(pairs)}쌍은 ZIP으로 받으세요.")
 
@@ -596,58 +766,266 @@ def render_image_tab(image_pairs):
                 st.image(pair["image_bytes_b"], use_container_width=True)
 
 
-def render_log_tab(log_entries):
-    if not log_entries:
-        st.info("처리 로그가 없습니다.")
-        return
-    import pandas as pd
-
-    st.dataframe(pd.DataFrame(log_entries), use_container_width=True)
-
-
 def render_excluded_tab(analysis):
-    """양식/공통 필터로 제외된 문장 목록."""
+    """자동 제외 목록(등장≥2) + 수동 입력으로 유사 문장 결과 추가 제외."""
     import pandas as pd
+    from collections import OrderedDict
 
     rows = analysis.get("excluded_sentences") or []
     stats = analysis.get("boilerplate_stats") or {}
+    multi = [r for r in rows if int(r.get("file_count") or 0) >= 2]
+
+    # --- 수동 제외 (텍스트 입력) ---
+    st.subheader("수동 제외 (단어·문장 입력)")
+    st.caption(
+        "한 줄에 하나(또는 쉼표로 구분) 입력하세요. "
+        "해당 문구가 포함된 유사 문장 쌍은 결과·통계·페이지 PNG·다운로드에서 제외됩니다."
+    )
+    if "manual_exclude_text" not in st.session_state:
+        st.session_state["manual_exclude_text"] = ""
+    raw_text = st.text_area(
+        "제외할 단어 또는 문장",
+        height=120,
+        placeholder="예:\n주관연구개발기관\n공동연구개발기관\n한국전자기술연구원",
+        key="manual_exclude_text",
+    )
+    b1, b2, _ = st.columns([1, 1, 2])
+    apply_manual = b1.button("입력 문구로 결과 제외", type="primary", key="manual_exclude_apply")
+    clear_manual = b2.button("수동 제외 해제", key="manual_exclude_clear")
+
+    if clear_manual:
+        st.session_state.pop("manual_exclude_terms", None)
+        st.session_state.pop("manual_exclude_view", None)
+        st.session_state["manual_exclude_text"] = ""
+        base_pairs = analysis.get("sentence_pairs_base") or analysis.get("sentence_pairs") or []
+        details = collect_matched_page_pair_details(base_pairs)
+        pdf_bytes = analysis.get("pdf_bytes_by_name") or {}
+        shots = []
+        if pdf_bytes and base_pairs:
+            shots = build_matched_page_screenshots(pdf_bytes, details, dpi=120)
+        st.session_state["matched_pages_zip"] = screenshots_to_zip(shots) if shots else None
+        st.rerun()
+
+    if apply_manual:
+        terms = parse_manual_exclude_terms(raw_text)
+        if not terms:
+            st.warning("제외할 단어/문장을 입력하세요.")
+        else:
+            with st.spinner("입력 문구로 유사 문장 결과·통계·페이지 PNG를 다시 구성하는 중..."):
+                view = build_manual_exclude_view(analysis, terms)
+            st.session_state["manual_exclude_terms"] = terms
+            st.session_state["manual_exclude_view"] = view
+            shots = view.get("matched_page_pngs") or []
+            st.session_state["matched_pages_zip"] = (
+                screenshots_to_zip(shots) if shots else None
+            )
+            st.rerun()
+
+    terms_applied = st.session_state.get("manual_exclude_terms") or []
+    view = st.session_state.get("manual_exclude_view")
+    if view is not None and terms_applied:
+        base_n = len(analysis.get("sentence_pairs_base") or analysis.get("sentence_pairs") or [])
+        kept_n = len(view.get("sentence_pairs") or [])
+        rem = view.get("manual_excluded_pairs") or []
+        st.success(
+            f"수동 제외 적용: 유사 문장 쌍 {base_n} → {kept_n} "
+            f"(제외 {len(rem)}쌍 · 문구 {len(terms_applied)}개)"
+        )
+        if rem:
+            with st.expander(f"수동 제외된 유사 문장 쌍 {len(rem)}개", expanded=False):
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "제외 문구": ", ".join(r.get("excluded_by") or []),
+                                "파일 A": r.get("file_a"),
+                                "파일 B": r.get("file_b"),
+                                "문장 A": r.get("text_a"),
+                                "문장 B": r.get("text_b"),
+                                "유사도": r.get("similarity"),
+                            }
+                            for r in rem
+                        ]
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+    st.divider()
+    st.subheader("자동 제외 문장 (등장 파일 수 ≥ 2)")
+
     if not rows:
-        st.info("제외된 문장이 없습니다. (필터가 꺼져 있거나, 해당 문장이 없었습니다.)")
+        st.info("자동 제외된 문장이 없습니다. (필터가 꺼져 있거나, 해당 문장이 없었습니다.)")
         return
 
-    df = pd.DataFrame(rows)
-    # 보기 좋은 컬럼 순서/이름
-    rename = {
-        "file_name": "파일명",
-        "location": "위치",
-        "text": "제외 문장",
-        "reason": "제외 사유",
-        "file_count": "등장 파일 수",
-    }
-    df = df.rename(columns=rename)
-    cols = [c for c in ["파일명", "위치", "제외 사유", "등장 파일 수", "제외 문장"] if c in df.columns]
-    df = df[cols]
-
     st.caption(
-        f"제외 문장 {len(df)}개 "
+        f"자동 제외 전체 {len(rows)}개 중 유의미 중복(등장 파일 수≥2) {len(multi)}개만 표시 "
         f"(패턴 {stats.get('removed_pattern', 0)} · "
         f"라벨형 {stats.get('removed_label', 0)} · "
-        f"파일공통 {stats.get('removed_common', 0)})"
+        f"파일공통 {stats.get('removed_common', 0)}). "
+        "등장 1회 문장은 표시하지 않습니다."
     )
+    st.info(
+        "아래 목록에서 선택한 문장은 **유사 문장 비교에 다시 포함**할 수 있습니다. "
+        "결과에서 빼고 싶은 단어/문장은 위 수동 제외 입력을 사용하세요."
+    )
+
+    groups: OrderedDict[str, dict] = OrderedDict()
+    for r in multi:
+        key = (r.get("normalized_text") or r.get("text") or "").strip()
+        if not key:
+            continue
+        if key not in groups:
+            groups[key] = {
+                "text": r.get("text") or key,
+                "file_count": int(r.get("file_count") or 0),
+                "reason": r.get("reason") or "",
+                "rows": [],
+            }
+        groups[key]["rows"].append(r)
+        groups[key]["file_count"] = max(
+            groups[key]["file_count"], int(r.get("file_count") or 0)
+        )
+
+    reason_opts = sorted({g["reason"] for g in groups.values() if g["reason"]})
     reason_filter = st.multiselect(
         "제외 사유 필터",
-        options=sorted(df["제외 사유"].dropna().unique().tolist()),
-        default=sorted(df["제외 사유"].dropna().unique().tolist()),
+        options=reason_opts,
+        default=reason_opts,
+        key="excluded_reason_filter",
     )
-    if reason_filter:
-        df = df[df["제외 사유"].isin(reason_filter)]
-    st.dataframe(df, use_container_width=True, hide_index=True)
-    st.download_button(
-        "excluded_sentences.csv 다운로드",
-        data=to_csv_bytes(df),
-        file_name="excluded_sentences.csv",
-        mime="text/csv",
-    )
+    visible = [
+        (k, g)
+        for k, g in groups.items()
+        if not reason_filter or g["reason"] in reason_filter
+    ]
+
+    prev = set(st.session_state.get("restore_selected_texts") or [])
+    st.markdown("**결과에 다시 포함할 문장**")
+    if not visible:
+        st.warning("표시할 유의미 중복 제외 문장이 없습니다.")
+    else:
+        checked_keys: list[str] = []
+        show_n = min(len(visible), 80)
+        for i, (key, g) in enumerate(visible[:show_n]):
+            label = (
+                f"[{g['reason']}] (파일 {g['file_count']}개) {g['text'][:120]}"
+                + ("…" if len(g["text"]) > 120 else "")
+            )
+            on = st.checkbox(
+                label,
+                value=(key in prev),
+                key=f"restore_cb_{abs(hash(key)) % 10_000_000}",
+            )
+            if on:
+                checked_keys.append(key)
+        if len(visible) > show_n:
+            with st.expander(f"나머지 {len(visible) - show_n}개 더 보기", expanded=False):
+                for key, g in visible[show_n:]:
+                    label = (
+                        f"[{g['reason']}] (파일 {g['file_count']}개) {g['text'][:120]}"
+                        + ("…" if len(g["text"]) > 120 else "")
+                    )
+                    on = st.checkbox(
+                        label,
+                        value=(key in prev),
+                        key=f"restore_cb_{abs(hash(key)) % 10_000_000}",
+                    )
+                    if on:
+                        checked_keys.append(key)
+
+        c1, c2 = st.columns([1, 1])
+        apply = c1.button("선택 문장 결과에 다시 포함", type="primary", key="restore_apply")
+        clear = c2.button("선택 해제", key="restore_clear")
+
+        if clear:
+            st.session_state["restore_selected_texts"] = []
+            st.rerun()
+
+        if apply:
+            if not checked_keys:
+                st.warning("다시 포함할 문장을 하나 이상 선택하세요.")
+            else:
+                settings = st.session_state.get("analysis_settings") or {}
+                restore_rows = []
+                for key in checked_keys:
+                    restore_rows.extend(groups[key]["rows"])
+                seen_ids = set()
+                uniq_rows = []
+                for r in restore_rows:
+                    rid = r.get("row_id") or f"{r.get('file_name')}||{r.get('text')}"
+                    if rid in seen_ids:
+                        continue
+                    seen_ids.add(rid)
+                    uniq_rows.append(r)
+
+                base_sentences = list(analysis.get("sentences") or [])
+                extra = [_row_to_sentence(r) for r in uniq_rows]
+                existing = {
+                    f"{s.file_name}||{s.location}||{(s.normalized_text or '').strip()}"
+                    for s in base_sentences
+                }
+                extra = [
+                    s
+                    for s in extra
+                    if f"{s.file_name}||{s.location}||{(s.normalized_text or '').strip()}"
+                    not in existing
+                ]
+                new_sentences = base_sentences + extra
+                remaining_excluded = [
+                    r
+                    for r in rows
+                    if (r.get("normalized_text") or r.get("text") or "").strip()
+                    not in set(checked_keys)
+                ]
+
+                with st.spinner(
+                    f"선택 {len(checked_keys)}개 문구({len(extra)}개 문장)를 포함해 "
+                    "유사 문장·통계·페이지 PNG를 다시 계산 중..."
+                ):
+                    updated = recompute_sentence_side(analysis, new_sentences, settings)
+
+                analysis_new = dict(analysis)
+                analysis_new.update(updated)
+                analysis_new["excluded_sentences"] = remaining_excluded
+                st.session_state["analysis"] = analysis_new
+                st.session_state["restore_selected_texts"] = []
+                st.session_state["excluded_restore_applied"] = checked_keys
+                # 수동 제외는 base가 바뀌었으므로 재적용 필요 → 일단 해제
+                st.session_state.pop("manual_exclude_view", None)
+                st.session_state.pop("manual_exclude_terms", None)
+                shots = updated.get("matched_page_pngs") or []
+                st.session_state["matched_pages_zip"] = (
+                    screenshots_to_zip(shots) if shots else None
+                )
+                st.success(
+                    f"다시 포함 완료: 문장 +{len(extra)} · "
+                    f"유사 문장 쌍 {len(updated.get('sentence_pairs') or [])}개"
+                )
+                st.rerun()
+
+        st.session_state["restore_selected_texts"] = checked_keys
+
+    if multi:
+        st.markdown("#### 유의미 중복 제외 목록 (표)")
+        df = pd.DataFrame(multi)
+        rename = {
+            "file_name": "파일명",
+            "location": "위치",
+            "text": "제외 문장",
+            "reason": "제외 사유",
+            "file_count": "등장 파일 수",
+        }
+        df = df.rename(columns=rename)
+        cols = [c for c in ["파일명", "위치", "제외 사유", "등장 파일 수", "제외 문장"] if c in df.columns]
+        st.dataframe(df[cols], use_container_width=True, hide_index=True)
+        st.download_button(
+            "excluded_sentences_meaningful.csv 다운로드",
+            data=to_csv_bytes(df[cols]),
+            file_name="excluded_sentences_meaningful.csv",
+            mime="text/csv",
+            key="dl_excluded_meaningful",
+        )
 
 
 def main():
@@ -690,9 +1068,20 @@ def main():
             help="□ 기술 요약, [1차년도…], 기관명 : … 등 서식/라벨 문장을 유사 문장 비교에서 제외합니다.",
         )
         exclude_common_sentences = st.checkbox(
-            "여러 파일에 공통인 동일 문장 제외",
+            "여러 파일에 공통인 짧은 양식 문구 제외",
             value=True,
-            help="파일 2개: 둘 다에 있을 때만. 3개 이상: N−1개 이상 파일에 동일 문장이 있으면 제외.",
+            help=(
+                "파일 2개: 둘 다, 3개 이상: N−1개 이상에 동일할 때만. "
+                "단, 짧은 양식 라벨만 제외하고 긴 기술 문장은 유사 검토용으로 남깁니다."
+            ),
+        )
+        common_max_length = st.number_input(
+            "파일공통 제외 최대 길이",
+            min_value=8,
+            max_value=80,
+            value=20,
+            help="이 글자 수 이하이면서 여러 파일에 공통인 짧은 양식 문구만 제외합니다. 기술 본문은 남깁니다.",
+            disabled=not exclude_common_sentences,
         )
         enable_image_analysis = st.checkbox("이미지 분석 사용", value=True)
         min_image_width = st.number_input(
@@ -721,54 +1110,72 @@ def main():
         "PDF 파일을 여러 개 업로드하세요", type=["pdf"], accept_multiple_files=True
     )
 
-    if not uploaded_files:
+    analysis = st.session_state.get("analysis")
+
+    # 다운로드 클릭 시 Streamlit이 스크립트를 다시 실행하면서 uploader가 비는 경우가 있음.
+    # 그때 early return 하면 download_button이 사라져 ZIP이 내려가지 않음 → 분석 결과가
+    # 세션에 있으면 업로드 없이도 결과/다운로드 UI를 유지한다.
+    if not uploaded_files and analysis is None:
         st.info("분석할 PDF 파일을 업로드해 주세요.")
         return
 
-    if len(uploaded_files) < 2:
+    if uploaded_files and len(uploaded_files) < 2:
         st.warning("비교를 위해 2개 이상의 파일을 업로드해 주세요.")
-        return
 
-    if st.button("분석 시작", type="primary"):
-        settings = {
-            "page_threshold": page_threshold,
-            "sentence_threshold": sentence_threshold,
-            "min_sentence_length": min_sentence_length,
-            "max_sentences": int(max_sentences),
-            "include_same_file": include_same_file,
-            "exclude_boilerplate_patterns": exclude_boilerplate_patterns,
-            "exclude_common_sentences": exclude_common_sentences,
-            "enable_image_analysis": enable_image_analysis,
-            "min_image_width": int(min_image_width),
-            "min_image_height": int(min_image_height),
-            "phash_threshold": phash_threshold,
-            "max_results": max_results,
-        }
-        with st.spinner("문서를 분석하고 있습니다..."):
-            analysis = run_analysis(uploaded_files, settings)
-        st.session_state["analysis"] = analysis
-        st.session_state["uploaded_file_names"] = [f.name for f in uploaded_files]
+    if uploaded_files and len(uploaded_files) >= 2:
+        if st.button("분석 시작", type="primary"):
+            settings = {
+                "page_threshold": page_threshold,
+                "sentence_threshold": sentence_threshold,
+                "min_sentence_length": min_sentence_length,
+                "max_sentences": int(max_sentences),
+                "include_same_file": include_same_file,
+                "exclude_boilerplate_patterns": exclude_boilerplate_patterns,
+                "exclude_common_sentences": exclude_common_sentences,
+                "common_max_length": int(common_max_length),
+                "enable_image_analysis": enable_image_analysis,
+                "min_image_width": int(min_image_width),
+                "min_image_height": int(min_image_height),
+                "phash_threshold": phash_threshold,
+                "max_results": max_results,
+            }
+            with st.spinner("문서를 분석하고 있습니다..."):
+                analysis = run_analysis(uploaded_files, settings)
+            _reset_result_filter_state()
+            st.session_state["analysis"] = analysis
+            st.session_state["analysis_settings"] = settings
+            st.session_state["uploaded_file_names"] = [f.name for f in uploaded_files]
+            # ZIP을 미리 만들어 두면 다운로드 클릭 시 재생성 부담·실패를 줄임
+            shots = analysis.get("matched_page_pngs") or []
+            st.session_state["matched_pages_zip"] = (
+                screenshots_to_zip(shots) if shots else None
+            )
 
     analysis = st.session_state.get("analysis")
     if analysis is None:
         return
 
-    tab_summary, tab_sentences, tab_images, tab_pages, tab_matched, tab_log, tab_excluded = st.tabs(
-        ["분석 요약", "유사 문장", "유사 이미지", "유사 페이지", "페이지 PNG", "처리 로그", "제외 문장"]
+    if not uploaded_files:
+        st.caption("이전 분석 결과를 표시 중입니다. 새 분석은 PDF를 다시 업로드한 뒤 실행하세요.")
+
+    # 수동 제외가 있으면 표시·다운로드에 반영 (원본 analysis는 세션에 유지)
+    display = merge_display_analysis(analysis)
+
+    tab_summary, tab_sentences, tab_images, tab_pages, tab_matched, tab_excluded = st.tabs(
+        ["분석 요약", "유사 문장", "유사 이미지", "유사 페이지", "페이지 PNG", "제외 문장"]
     )
 
     with tab_summary:
-        summary_dict = render_summary_tab(analysis, uploaded_files)
+        n_files = len(display.get("file_names") or st.session_state.get("uploaded_file_names") or [])
+        summary_dict = render_summary_tab(display, file_count=n_files)
     with tab_sentences:
-        render_sentence_tab(analysis["sentence_pairs"])
+        render_sentence_tab(display["sentence_pairs"])
     with tab_images:
-        render_image_tab(analysis["image_pairs"])
+        render_image_tab(display["image_pairs"])
     with tab_pages:
-        render_page_tab(analysis.get("page_pairs", []))
+        render_page_tab(display.get("page_pairs", []))
     with tab_matched:
-        render_matched_pages_tab(analysis)
-    with tab_log:
-        render_log_tab(analysis["log_entries"])
+        render_matched_pages_tab(display)
     with tab_excluded:
         render_excluded_tab(analysis)
 
@@ -778,48 +1185,57 @@ def main():
     with col1:
         st.download_button(
             "similar_pages.csv",
-            data=to_csv_bytes(page_pairs_to_df(analysis.get("page_pairs", []))),
+            data=to_csv_bytes(page_pairs_to_df(display.get("page_pairs", []))),
             file_name="similar_pages.csv",
             mime="text/csv",
+            key="dl_similar_pages",
         )
     with col2:
         st.download_button(
             "similar_sentences.csv",
-            data=to_csv_bytes(sentence_pairs_to_df(analysis["sentence_pairs"])),
+            data=to_csv_bytes(sentence_pairs_to_df(display["sentence_pairs"])),
             file_name="similar_sentences.csv",
             mime="text/csv",
+            key="dl_similar_sentences",
         )
     with col3:
         st.download_button(
             "similar_images.csv",
-            data=to_csv_bytes(image_pairs_to_df(analysis["image_pairs"])),
+            data=to_csv_bytes(image_pairs_to_df(display["image_pairs"])),
             file_name="similar_images.csv",
             mime="text/csv",
+            key="dl_similar_images",
         )
     with col4:
-        shots = analysis.get("matched_page_pngs") or []
-        if shots:
+        shots = display.get("matched_page_pngs") or []
+        zip_bytes = st.session_state.get("matched_pages_zip")
+        if zip_bytes is None and shots:
+            zip_bytes = screenshots_to_zip(shots)
+            st.session_state["matched_pages_zip"] = zip_bytes
+        if zip_bytes:
             st.download_button(
-                "matched_pages.zip",
-                data=screenshots_to_zip(shots),
+                "matched_pages.zip (합본)",
+                data=zip_bytes,
                 file_name="matched_pages.zip",
                 mime="application/zip",
+                key="dl_matched_pages_footer",
             )
         else:
-            st.button("matched_pages.zip", disabled=True)
+            st.button("matched_pages.zip", disabled=True, key="dl_matched_pages_disabled")
     with col5:
         excel_bytes = build_excel_report(
             summary_dict,
-            analysis["sentence_pairs"],
-            analysis["image_pairs"],
-            analysis["log_entries"],
-            page_pairs=analysis.get("page_pairs", []),
+            display["sentence_pairs"],
+            display["image_pairs"],
+            display["log_entries"],
+            page_pairs=display.get("page_pairs", []),
         )
         st.download_button(
             "similarity_analysis.xlsx",
             data=excel_bytes,
             file_name="similarity_analysis.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_excel_report",
         )
 
 

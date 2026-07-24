@@ -282,6 +282,62 @@ def _pair_stem(file_a: str, page_a: int, file_b: str, page_b: int) -> str:
     )
 
 
+def stitch_side_by_side(
+    png_a: bytes,
+    png_b: bytes,
+    *,
+    caption_a: str = "A",
+    caption_b: str = "B",
+    gap: int = 20,
+    header_h: int = 40,
+    bg=(255, 255, 255),
+) -> Optional[bytes]:
+    """미리보기처럼 A|B 페이지를 한 장 PNG로 가로 결합."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception:
+        return None
+    try:
+        img_a = Image.open(io.BytesIO(png_a)).convert("RGB")
+        img_b = Image.open(io.BytesIO(png_b)).convert("RGB")
+    except Exception:
+        return None
+
+    # 높이 맞추기 (작은 쪽에 맞춤 후 여백)
+    target_h = max(img_a.height, img_b.height)
+
+    def _pad(im: Image.Image) -> Image.Image:
+        if im.height == target_h:
+            return im
+        canvas = Image.new("RGB", (im.width, target_h), bg)
+        canvas.paste(im, (0, (target_h - im.height) // 2))
+        return canvas
+
+    img_a = _pad(img_a)
+    img_b = _pad(img_b)
+    width = img_a.width + gap + img_b.width
+    height = header_h + target_h
+    out = Image.new("RGB", (width, height), bg)
+    draw = ImageDraw.Draw(out)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+
+    draw.text((8, 10), caption_a[:80], fill=(30, 30, 30), font=font)
+    draw.text((img_a.width + gap + 8, 10), caption_b[:80], fill=(30, 30, 30), font=font)
+    # 구분선
+    x_div = img_a.width + gap // 2
+    draw.line([(x_div, header_h), (x_div, height)], fill=(200, 200, 200), width=2)
+
+    out.paste(img_a, (0, header_h))
+    out.paste(img_b, (img_a.width + gap, header_h))
+
+    buf = io.BytesIO()
+    out.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def build_matched_page_screenshots(
     pdf_bytes_by_name: dict[str, bytes],
     page_pairs: list,
@@ -290,6 +346,9 @@ def build_matched_page_screenshots(
 ) -> list[dict]:
     """
     유사 문장 페이지 쌍을 PNG로 렌더 (매칭 문장 노란색 하이라이트).
+
+    각 쌍에 대해 A/B 개별 PNG와, 나란히 합친 AB PNG를 만든다.
+    ZIP 다운로드는 AB(합본)만 사용한다.
 
     page_pairs: collect_matched_page_pairs 결과 또는
                 collect_matched_page_pair_details 결과.
@@ -321,6 +380,7 @@ def build_matched_page_screenshots(
         texts_a = d.get("texts_a") or []
         texts_b = d.get("texts_b") or []
 
+        sides: dict[str, dict] = {}
         for side, fname, page, texts in (
             ("A", file_a, page_a, texts_a),
             ("B", file_b, page_b, texts_b),
@@ -333,35 +393,72 @@ def build_matched_page_screenshots(
             )
             if not png:
                 continue
-            out_name = f"{stem}__{side}.png"
-            results.append(
-                {
-                    "pair_label": pair_label,
-                    "side": side,
-                    "file_name": fname,
-                    "page_number": page,
-                    "file_a": file_a,
-                    "page_a": page_a,
-                    "file_b": file_b,
-                    "page_b": page_b,
-                    "filename": out_name,
-                    "png_bytes": png,
-                    "highlight_texts": texts,
-                    "highlight_hits": hit_count,
-                    "pair_count": d.get("pair_count", 0),
-                }
+            item = {
+                "pair_label": pair_label,
+                "side": side,
+                "file_name": fname,
+                "page_number": page,
+                "file_a": file_a,
+                "page_a": page_a,
+                "file_b": file_b,
+                "page_b": page_b,
+                "filename": f"{stem}__{side}.png",
+                "png_bytes": png,
+                "highlight_texts": texts,
+                "highlight_hits": hit_count,
+                "pair_count": d.get("pair_count", 0),
+            }
+            sides[side] = item
+            results.append(item)
+
+        # 나란히 합본 (다운로드용)
+        if "A" in sides and "B" in sides:
+            combined = stitch_side_by_side(
+                sides["A"]["png_bytes"],
+                sides["B"]["png_bytes"],
+                caption_a=f"A: {file_a}  p.{page_a}",
+                caption_b=f"B: {file_b}  p.{page_b}",
             )
+            if combined:
+                results.append(
+                    {
+                        "pair_label": pair_label,
+                        "side": "AB",
+                        "file_name": f"{file_a} | {file_b}",
+                        "page_number": page_a,
+                        "file_a": file_a,
+                        "page_a": page_a,
+                        "file_b": file_b,
+                        "page_b": page_b,
+                        "filename": f"{stem}.png",
+                        "png_bytes": combined,
+                        "highlight_texts": (texts_a or []) + (texts_b or []),
+                        "highlight_hits": sides["A"].get("highlight_hits", 0)
+                        + sides["B"].get("highlight_hits", 0),
+                        "pair_count": d.get("pair_count", 0),
+                        "png_a": sides["A"]["png_bytes"],
+                        "png_b": sides["B"]["png_bytes"],
+                        "hits_a": sides["A"].get("highlight_hits", 0),
+                        "hits_b": sides["B"].get("highlight_hits", 0),
+                        "texts_a": texts_a,
+                        "texts_b": texts_b,
+                    }
+                )
     return results
 
 
-def screenshots_to_zip(screenshots: list[dict]) -> bytes:
-    """스크린샷 목록을 ZIP 바이트로 묶는다."""
+def screenshots_to_zip(screenshots: list[dict], *, combined_only: bool = True) -> bytes:
+    """스크린샷 목록을 ZIP으로 묶는다. 기본은 A|B 합본(side=AB)만 넣는다."""
+    items = list(screenshots or [])
+    if combined_only:
+        combined = [s for s in items if s.get("side") == "AB"]
+        if combined:
+            items = combined
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         used: set[str] = set()
-        for item in screenshots:
+        for item in items:
             name = item["filename"]
-            # 동일 파일명 중복 방지
             if name in used:
                 continue
             used.add(name)
