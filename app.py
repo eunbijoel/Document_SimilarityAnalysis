@@ -44,11 +44,11 @@ from src.utils.summary_stats import (
     compute_sentence_overlap_stats,
     compute_similarity_distribution,
     compute_file_pair_matrix,
-    collect_matched_page_keys,
 )
 from src.utils.page_screenshots import (
     build_matched_page_screenshots,
     screenshots_to_zip,
+    collect_matched_page_pairs,
 )
 
 st.set_page_config(page_title="문서 간 유사 콘텐츠 분석기", layout="wide")
@@ -184,11 +184,11 @@ def run_analysis(uploaded_files, settings):
         image_pairs.sort(key=lambda p: p["phash_distance"])
         image_pairs = image_pairs[: settings["max_results"]]
 
-    # --- 유사 문장 페이지 PNG 렌더 ---
+    # --- 유사 문장 페이지 PNG 렌더 (파일A_pX=파일B_pY 이름) ---
     status_text.text("유사 문장 페이지 스크린샷 생성 중...")
-    page_keys = collect_matched_page_keys(sentence_pairs)
+    page_pairs_for_png = collect_matched_page_pairs(sentence_pairs)
     matched_page_pngs = build_matched_page_screenshots(
-        pdf_bytes_by_name, page_keys, dpi=120
+        pdf_bytes_by_name, page_pairs_for_png, dpi=120
     )
 
     status_text.text("분석이 완료되었습니다.")
@@ -379,17 +379,43 @@ def render_summary_tab(analysis, uploaded_files):
 
 
 def render_matched_pages_tab(analysis):
-    """유사 문장이 포함된 페이지 PNG 미리보기·ZIP 다운로드."""
+    """유사 문장이 포함된 페이지 PNG — 파일A p.X = 파일B p.Y 이름으로 저장."""
     shots = analysis.get("matched_page_pngs") or []
     if not shots:
         st.info("유사 문장 쌍에서 추출할 페이지 스크린샷이 없습니다.")
         return
 
-    st.caption(f"유사 문장이 있는 페이지 {len(shots)}장 (중복 페이지는 1장만 저장)")
-    meta = [{"파일": s["file_name"], "페이지": s["page_number"], "파일명": s["filename"]} for s in shots]
+    # pair_label 기준으로 묶기
+    from collections import OrderedDict
+
+    pairs: OrderedDict = OrderedDict()
+    for s in shots:
+        label = s.get("pair_label") or f"{s['file_name']} p.{s['page_number']}"
+        pairs.setdefault(label, {"A": None, "B": None, "meta": s})
+        pairs[label][s.get("side", "A")] = s
+
+    st.caption(
+        f"유사 문장 페이지 쌍 {len(pairs)}개 "
+        f"(파일명 예: `파일A_p0003=파일B_p0012__A.png`)"
+    )
+
     import pandas as pd
 
-    st.dataframe(pd.DataFrame(meta), use_container_width=True, hide_index=True)
+    meta_rows = []
+    for label, sides in pairs.items():
+        meta = sides["meta"]
+        meta_rows.append(
+            {
+                "비교": label,
+                "파일 A": meta.get("file_a", ""),
+                "페이지 A": meta.get("page_a", ""),
+                "파일 B": meta.get("file_b", ""),
+                "페이지 B": meta.get("page_b", ""),
+                "파일명 A": (sides["A"] or {}).get("filename", ""),
+                "파일명 B": (sides["B"] or {}).get("filename", ""),
+            }
+        )
+    st.dataframe(pd.DataFrame(meta_rows), use_container_width=True, hide_index=True)
 
     zip_bytes = screenshots_to_zip(shots)
     st.download_button(
@@ -399,15 +425,24 @@ def render_matched_pages_tab(analysis):
         mime="application/zip",
     )
 
-    st.markdown("#### 미리보기")
-    for i, s in enumerate(shots[:30]):  # UI 과부하 방지
-        with st.expander(
-            f"{s['file_name']} · 페이지 {s['page_number']}",
-            expanded=(i == 0),
-        ):
-            st.image(s["png_bytes"], use_container_width=True)
-    if len(shots) > 30:
-        st.info(f"미리보기는 처음 30장만 표시합니다. 전체 {len(shots)}장은 ZIP으로 받으세요.")
+    st.markdown("#### 나란히 미리보기")
+    for i, (label, sides) in enumerate(list(pairs.items())[:30]):
+        with st.expander(label, expanded=(i == 0)):
+            c1, c2 = st.columns(2)
+            with c1:
+                a = sides.get("A")
+                if a:
+                    st.markdown(f"**A:** {a['file_name']} · 페이지 {a['page_number']}")
+                    st.caption(a["filename"])
+                    st.image(a["png_bytes"], use_container_width=True)
+            with c2:
+                b = sides.get("B")
+                if b:
+                    st.markdown(f"**B:** {b['file_name']} · 페이지 {b['page_number']}")
+                    st.caption(b["filename"])
+                    st.image(b["png_bytes"], use_container_width=True)
+    if len(pairs) > 30:
+        st.info(f"미리보기는 처음 30쌍만 표시합니다. 전체 {len(pairs)}쌍은 ZIP으로 받으세요.")
 
 
 
@@ -592,18 +627,18 @@ def main():
     if analysis is None:
         return
 
-    tab_summary, tab_pages, tab_sentences, tab_images, tab_matched, tab_log = st.tabs(
-        ["분석 요약", "유사 페이지", "유사 문장", "유사 이미지", "매칭 페이지 PNG", "처리 로그"]
+    tab_summary, tab_sentences, tab_images, tab_pages, tab_matched, tab_log = st.tabs(
+        ["분석 요약", "유사 문장", "유사 이미지", "유사 페이지", "페이지 PNG", "처리 로그"]
     )
 
     with tab_summary:
         summary_dict = render_summary_tab(analysis, uploaded_files)
-    with tab_pages:
-        render_page_tab(analysis.get("page_pairs", []))
     with tab_sentences:
         render_sentence_tab(analysis["sentence_pairs"])
     with tab_images:
         render_image_tab(analysis["image_pairs"])
+    with tab_pages:
+        render_page_tab(analysis.get("page_pairs", []))
     with tab_matched:
         render_matched_pages_tab(analysis)
     with tab_log:
