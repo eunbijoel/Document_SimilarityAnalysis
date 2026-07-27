@@ -66,8 +66,12 @@ def render_excluded_tab(
 
 def _render_manual_exclude_section(analysis: dict) -> None:
     st.subheader("수동 제외 (단어·문장 입력)")
-    st.caption(
-        "한 줄에 하나(또는 쉼표로 구분). 「적용」을 누를 때만 결과에서 제외합니다."
+    st.markdown(
+        '<p style="color:#c62828;font-weight:700;font-size:0.95rem;margin:0.25rem 0 0.75rem 0;">'
+        "한 줄에 하나(또는 쉼표로 구분). "
+        "아래 「입력 문구로 결과 제외」를 누를 때만 결과에서 빠집니다."
+        "</p>",
+        unsafe_allow_html=True,
     )
     with st.form("manual_exclude_form", clear_on_submit=False):
         raw_text = st.text_area(
