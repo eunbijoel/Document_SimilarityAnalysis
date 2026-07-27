@@ -1,11 +1,3 @@
-"""문서 간 유사 콘텐츠 분석기
-
-여러 문서를 업로드하면 동일하거나 유사한 문장/페이지/이미지를 찾아 보여주는
-내부 검토용 Streamlit 도구입니다. 표절 여부를 자동으로 판정하지 않습니다.
-
-지원 형식: PDF, DOCX, PPTX, HWP, HWPX, TXT/MD 등 텍스트.
-페이지 PNG 하이라이트는 PDF만 가능합니다.
-"""
 import os
 
 # Keras 3 / Transformers 충돌 방지 (다른 import보다 먼저)
