@@ -6,15 +6,15 @@
 # --- 문장 유사도 ---
 SENTENCE_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"  # 다국어(한국어 포함) 지원 모델
 
-DEFAULT_SENTENCE_THRESHOLD = 0.80  # 이 미만은 결과에 포함하지 않음
-DEFAULT_MIN_SENTENCE_LENGTH = 8
+DEFAULT_SENTENCE_THRESHOLD = 0.85  # 이 미만은 결과에 포함하지 않음 (짧은 구절 오탐 완화)
+DEFAULT_MIN_SENTENCE_LENGTH = 12  # 너무 짧은 연결 문구 제외
 DEFAULT_TOP_K = 5  # NearestNeighbors에서 문장 하나당 검색할 이웃 개수
 
 # 유사도 -> 판정 라벨 매핑 (내림차순으로 정렬되어 있어야 함)
 SENTENCE_VERDICT_LEVELS = [
     (1.00, "동일 문장"),
     (0.90, "매우 유사"),
-    (0.80, "유사 가능성"),
+    (0.85, "유사 가능성"),
 ]
 
 

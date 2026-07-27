@@ -3,7 +3,9 @@
 1) 완전히 동일한 문장은 문자열 비교로 먼저 찾습니다 (임베딩 계산 불필요).
 2) 나머지는 다국어 sentence-transformers 임베딩 + NearestNeighbors(top-k)로
    전체 N×N 행렬을 만들지 않고 유사 문장 쌍을 찾습니다.
-3) 페이지 전체 텍스트는 초안(compare_page_texts)과 같이 cosine 행렬로 비교합니다.
+3) 짧은 문장에서 임베딩이 의미 없는 고점수를 내는 경우를 막기 위해,
+   어휘(토큰) 겹침이 거의 없는 쌍은 제외합니다.
+4) 페이지 전체 텍스트는 초안(compare_page_texts)과 같이 cosine 행렬로 비교합니다.
 
 이 모듈은 Streamlit에 의존하지 않습니다 (테스트 용이성을 위해).
 모델 캐싱(st.cache_resource)은 app.py에서 이 모듈의 load_model을 감싸서 처리합니다.
@@ -11,6 +13,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections import defaultdict
 from typing import Optional
 
@@ -31,6 +34,13 @@ from src.utils.config import (
     PAGE_TEXT_EMBED_MAX_CHARS,
     PAGE_TEXT_PREVIEW_CHARS,
 )
+
+# 짧은 구절에서 MiniLM이 의미와 무관한 고유사도를 내는 오탐 완화
+_TOKEN_RE = re.compile(r"[가-힣]{2,}|[A-Za-z0-9]{2,}")
+_MIN_SHARED_TOKENS = 1
+_MIN_JACCARD_SHORT = 0.20  # 짧은 문장(둘 중 하나 < 25자)
+_MIN_JACCARD_LONG = 0.08
+_SHORT_CHAR_LEN = 25
 
 
 def load_model(model_name: str):
@@ -66,6 +76,48 @@ def compute_embeddings(model, texts: list[str], batch_size: int = EMBEDDING_BATC
 
 def _pair_key(i: int, j: int) -> tuple[int, int]:
     return (i, j) if i < j else (j, i)
+
+
+def _content_tokens(text: str) -> set[str]:
+    return set(_TOKEN_RE.findall(text or ""))
+
+
+def _char_bigrams(text: str) -> set[str]:
+    compact = re.sub(r"\s+", "", text or "")
+    if len(compact) < 2:
+        return {compact} if compact else set()
+    return {compact[i : i + 2] for i in range(len(compact) - 1)}
+
+
+def has_lexical_support(text_a: str, text_b: str) -> bool:
+    """임베딩만으로 묶인 쌍이 실제로 단어/글자가 겹치는지 확인합니다.
+
+    문서 재사용·유사 검토 목적상, 공유 어휘가 전혀 없는 '의미만 비슷한 척'
+    고점수는 오탐으로 보고 제외합니다.
+    """
+    a = (text_a or "").strip()
+    b = (text_b or "").strip()
+    if not a or not b:
+        return False
+
+    short = min(len(a), len(b)) < _SHORT_CHAR_LEN
+    ta, tb = _content_tokens(a), _content_tokens(b)
+    if ta and tb:
+        inter = ta & tb
+        if inter:
+            union = ta | tb
+            jaccard = len(inter) / len(union)
+            need = _MIN_JACCARD_SHORT if short else _MIN_JACCARD_LONG
+            if len(inter) >= 2 or (len(inter) >= _MIN_SHARED_TOKENS and jaccard >= need):
+                return True
+
+    # 토큰 분절이 어색한 한글(붙여쓰기) 대비: 문자 bigram 겹침
+    ba, bb = _char_bigrams(a), _char_bigrams(b)
+    if not ba or not bb:
+        return False
+    bigram_j = len(ba & bb) / len(ba | bb)
+    need_bg = 0.28 if short else 0.18
+    return bigram_j >= need_bg
 
 
 def find_exact_duplicate_pairs(
@@ -149,6 +201,9 @@ def find_similar_sentence_pairs(
                 continue
             rec_i, rec_j = sentences[i], sentences[j]
             if not include_same_file and rec_i.file_name == rec_j.file_name:
+                continue
+            # 짧은 문장 임베딩 오탐 차단 (예: "장표에 있는 바와 같이" ↔ 무관 구절 93%)
+            if not has_lexical_support(rec_i.normalized_text, rec_j.normalized_text):
                 continue
             seen_pairs.add(key)
             results.append(_make_pair_result(rec_i, rec_j, similarity))
