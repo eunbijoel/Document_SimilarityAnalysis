@@ -743,7 +743,11 @@ def render_image_tab(image_pairs):
 
 
 def main():
-    st.title("문서 간 유사 콘텐츠 분석기")
+    st.markdown(
+        '<h1 style="margin:0;"><a href="/" target="_self" '
+        'style="text-decoration:none;color:inherit;">문서 간 유사 콘텐츠 분석기</a></h1>',
+        unsafe_allow_html=True,
+    )
     st.caption(
         "여러 문서를 함께 분석하여 서로 유사한 페이지·문장·이미지를 찾습니다. "
         "분석 결과는 검토 참고용이며 표절 여부를 자동으로 판정하지 않습니다."
