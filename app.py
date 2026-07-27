@@ -1,7 +1,10 @@
 """문서 간 유사 콘텐츠 분석기
 
-여러 PDF 문서를 업로드하면 동일하거나 유사한 문장/페이지/이미지를 찾아 보여주는
+여러 문서를 업로드하면 동일하거나 유사한 문장/페이지/이미지를 찾아 보여주는
 내부 검토용 Streamlit 도구입니다. 표절 여부를 자동으로 판정하지 않습니다.
+
+지원 형식: PDF, DOCX, PPTX, HWP, HWPX, TXT/MD 등 텍스트.
+페이지 PNG 하이라이트는 PDF만 가능합니다.
 """
 import os
 
@@ -14,7 +17,7 @@ import traceback
 
 import streamlit as st
 
-from src.parsers.pdf_parser import parse_pdf
+from src.parsers.dispatch import SUPPORTED_EXTENSIONS, parse_document
 from src.analyzers.text_similarity import (
     load_model,
     find_exact_duplicate_pairs,
@@ -136,8 +139,9 @@ def run_analysis(uploaded_files, settings):
         status_text.text(f"처리 중: {uploaded_file.name} ({idx + 1}/{total})")
         try:
             file_bytes = uploaded_file.read()
+            # 페이지 PNG 렌더는 PDF만 가능 — 동일 키에 보관하되 비PDF는 스킵됨
             pdf_bytes_by_name[uploaded_file.name] = file_bytes
-            result = parse_pdf(
+            result = parse_document(
                 uploaded_file.name,
                 file_bytes,
                 min_sentence_length=settings["min_sentence_length"],
@@ -203,14 +207,14 @@ def run_analysis(uploaded_files, settings):
                 "자세한 목록은「제외 문장」탭에서 확인할 수 있습니다."
             )
 
-    # --- 문장 hard-cap (대용량 PDF 안전장치, 초안 max_sentences=5000) ---
+    # --- 문장 hard-cap (대용량 문서 안전장치, 초안 max_sentences=5000) ---
     max_sentences = settings["max_sentences"]
     truncated = False
     if len(all_sentences) > max_sentences:
         truncated = True
         st.warning(
             f"추출 문장(필터 후) {len(all_sentences)}개 → 비교는 상위 {max_sentences}개만 사용합니다. "
-            "(대용량 PDF 실행시간·메모리 보호용 hard-cap)"
+            "(대용량 문서 실행시간·메모리 보호용 hard-cap)"
         )
         all_sentences = all_sentences[:max_sentences]
     elif len(all_sentences) > max_sentences * 0.8:
@@ -533,7 +537,8 @@ def render_matched_pages_tab(analysis):
     st.caption(
         f"유사 문장 페이지 쌍 {len(pairs)}개 · "
         "ZIP에는 A|B를 나란히 합친 이미지 1장씩 들어갑니다 "
-        "(파일명 예: `파일A_p0003=파일B_p0012.png`)."
+        "(파일명 예: `파일A_p0003=파일B_p0012.png`). "
+        "페이지 PNG 렌더는 PDF만 지원합니다 (DOCX/PPTX/HWP 등은 문장·페이지 텍스트 비교만)."
     )
 
     import pandas as pd
@@ -767,7 +772,7 @@ def main():
             max_value=50000,
             value=DEFAULT_MAX_SENTENCES,
             step=100,
-            help="대용량 PDF에서 비교에 사용할 문장 상한 (초안 기본 5000)",
+            help="대용량 문서에서 비교에 사용할 문장 상한 (초안 기본 5000)",
         )
         include_same_file = st.checkbox("동일 파일 내부 비교 포함", value=False)
         st.markdown("**양식 문장 필터**")
@@ -816,7 +821,9 @@ def main():
         )
 
     uploaded_files = st.file_uploader(
-        "PDF 파일을 여러 개 업로드하세요", type=["pdf"], accept_multiple_files=True
+        "문서를 여러 개 업로드하세요 (PDF · DOCX · PPTX · HWP · HWPX · TXT/MD)",
+        type=list(SUPPORTED_EXTENSIONS),
+        accept_multiple_files=True,
     )
 
     analysis = st.session_state.get("analysis")
@@ -825,7 +832,7 @@ def main():
     # 그때 early return 하면 download_button이 사라져 ZIP이 내려가지 않음 → 분석 결과가
     # 세션에 있으면 업로드 없이도 결과/다운로드 UI를 유지한다.
     if not uploaded_files and analysis is None:
-        st.info("분석할 PDF 파일을 업로드해 주세요.")
+        st.info("분석할 문서를 2개 이상 업로드해 주세요.")
         return
 
     if uploaded_files and len(uploaded_files) < 2:
@@ -865,7 +872,7 @@ def main():
         return
 
     if not uploaded_files:
-        st.caption("이전 분석 결과를 표시 중입니다. 새 분석은 PDF를 다시 업로드한 뒤 실행하세요.")
+        st.caption("이전 분석 결과를 표시 중입니다. 새 분석은 문서를 다시 업로드한 뒤 실행하세요.")
 
     # 수동 제외가 있으면 표시·다운로드에 반영 (원본 analysis는 세션에 유지)
     display = merge_display_analysis(analysis)

@@ -9,3 +9,4 @@ ImageHash
 sentence-transformers
 scikit-learn
 lxml
+olefile
